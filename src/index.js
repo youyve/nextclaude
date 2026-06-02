@@ -374,7 +374,9 @@ async function statusCommand() {
     const data = await res.json();
 
     console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
+    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage`);
+    if (data.activeSessions != null) console.log(`Sessions:       ${data.activeSessions} pinned`);
+    console.log('');
 
     for (const acct of data.accounts) {
       const q = acct.quota;
@@ -394,6 +396,9 @@ async function statusCommand() {
       }
 
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
+      if (acct.usage.totalCacheCreationTokens || acct.usage.totalCacheReadTokens) {
+        console.log(`    Cache:    ${acct.usage.totalCacheCreationTokens} created (rebuilds), ${acct.usage.totalCacheReadTokens} read (warm), ${acct.usage.totalSwitchRebuilds} cold rebuild(s)`);
+      }
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
       console.log('');
     }

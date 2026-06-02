@@ -17,6 +17,24 @@ function emptyQuota() {
   };
 }
 
+function emptyUsage() {
+  return {
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    // Prompt-cache accounting (Layer 0): cache_creation = expensive cold rebuild
+    // writes (~1.25x), cache_read = cheap warm-prefix hits (~0.1x). High
+    // cache_read + ~0 cache_creation on a bound account confirms affinity is
+    // keeping it warm; a cache_creation spike marks a switch-induced rebuild.
+    totalCacheCreationTokens: 0,
+    totalCacheReadTokens: 0,
+    lastCacheReadTokens: null,      // most recent request's cache_read (Layer 2 trough signal)
+    lastCacheCreationTokens: null,
+    totalRequests: 0,
+    totalSwitchRebuilds: 0,         // count of switch-induced cold rebuilds observed
+    lastUsed: null,
+  };
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98) {
     this.accounts = accounts.map((acct, index) => ({
@@ -29,28 +47,173 @@ export class AccountManager {
       expiresAt: acct.expiresAt || null,
       status: 'active',
       quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
+      usage: emptyUsage(),
       rateLimitedUntil: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+
+    // Per-conversation account affinity (Layer 1): pin each session to one
+    // account and never switch back to a cache-cold account it already left.
+    // Keyed by a body-derived session hash (see server.js deriveSessionKey).
+    // Value: { pinned: identity, burned: Set<identity>, lastSeen: ms }.
+    // Identity is accountUuid||name so it survives removeAccount() reindexing.
+    this.sessions = new Map();
+    this._sessionTtlMs = 30 * 60 * 1000; // forget idle conversations after 30m
+    this._maxSessions = 2000;
   }
 
   /**
-   * Get the best available account, rotating if the current one is near quota.
-   * Returns null if all accounts are exhausted.
+   * Get the account that should serve this request.
+   *
+   * With a sessionKey (Layer 1: per-conversation affinity) the conversation is
+   * pinned to one account and stays there while it is available — so its large
+   * prompt-cache prefix keeps hitting cache_read (~0.1x) on a warm org instead
+   * of being re-billed as cache_creation (~1.25x) on a cold one. When the pinned
+   * account is genuinely exhausted we switch FORWARD only: the old account is
+   * "burned" for this session and never re-selected (its cache died at the 5min
+   * TTL long ago, so returning would just pay another full rebuild). This holds
+   * the realized rebuild count at the N-1 floor and fixes the concurrent-session
+   * bug where the single global currentIndex let interleaved conversations flip
+   * each other's account and trigger cold rebuilds.
+   *
+   * Without a sessionKey (non-JSON body / fallback) it keeps the legacy global
+   * behavior. Returns null if all accounts are exhausted.
    */
-  getActiveAccount() {
-    const current = this.accounts[this.currentIndex];
-    if (this._isAvailable(current)) {
-      return current;
+  getActiveAccount(sessionKey = null) {
+    if (!sessionKey) {
+      const current = this.accounts[this.currentIndex];
+      if (this._isAvailable(current)) return current;
+      return this._selectNext();
     }
-    return this._selectNext();
+
+    let sess = this.sessions.get(sessionKey);
+    if (!sess) {
+      sess = { pinned: null, burned: new Set(), lastSeen: Date.now() };
+      this.sessions.set(sessionKey, sess);
+      this._evictSessions();
+    }
+    sess.lastSeen = Date.now();
+
+    // Stay on the pinned account while it can still serve.
+    const pinned = sess.pinned ? this._byIdentity(sess.pinned) : null;
+    if (pinned && this._isAvailable(pinned)) {
+      this.currentIndex = pinned.index;
+      return pinned;
+    }
+
+    // Pinned account is exhausted/gone: burn it (never come back) and switch
+    // forward to the available account with the most remaining quota.
+    if (sess.pinned) sess.burned.add(sess.pinned);
+    let next = this._selectBest(sess.burned);
+
+    // All non-burned accounts are unavailable. Only now do we accept an
+    // unavoidable rebuild on a reset account — clear the burn set and fall back
+    // to the soonest-resetting account (preserves the terminal all-exhausted path).
+    if (!next) {
+      sess.burned.clear();
+      next = this._selectBest() || this._selectSoonestReset();
+    }
+
+    if (next) {
+      if (sess.pinned && sess.pinned !== this._identity(next)) {
+        console.log(`[NextClaude] Session switched "${this._shortKey(sessionKey)}" → "${next.name}"`);
+      }
+      sess.pinned = this._identity(next);
+      this.currentIndex = next.index;
+    }
+    return next;
+  }
+
+  // ── Layer 1 helpers ──────────────────────────────────
+
+  _identity(account) {
+    return account.accountUuid || account.name;
+  }
+
+  _byIdentity(identity) {
+    return this.accounts.find(a => this._identity(a) === identity) || null;
+  }
+
+  _shortKey(key) {
+    return typeof key === 'string' ? key.slice(0, 8) : String(key);
+  }
+
+  /**
+   * Normalized utilization 0-1 for ranking (max of any tracked quota).
+   * Accounts with no quota data yet score 0 (treated as freshest).
+   */
+  _utilization(account) {
+    const q = account.quota;
+    if (q.unified5h != null || q.unified7d != null) {
+      return Math.max(q.unified5h || 0, q.unified7d || 0);
+    }
+    let u = 0;
+    if (q.tokensLimit != null && q.tokensRemaining != null) {
+      u = Math.max(u, 1 - q.tokensRemaining / q.tokensLimit);
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null) {
+      u = Math.max(u, 1 - q.requestsRemaining / q.requestsLimit);
+    }
+    return u;
+  }
+
+  /**
+   * Pick the available account with the most remaining quota (lowest
+   * utilization), optionally excluding a set of burned identities. Maximizing
+   * survival on the chosen account minimizes the total number of forced
+   * switches — and thus the number of cold rebuilds — over a long task.
+   */
+  _selectBest(exclude = null) {
+    let best = null;
+    let bestUtil = Infinity;
+    for (const account of this.accounts) {
+      if (exclude && exclude.has(this._identity(account))) continue;
+      if (!this._isAvailable(account)) continue;
+      const u = this._utilization(account);
+      if (u < bestUtil) { bestUtil = u; best = account; }
+    }
+    return best;
+  }
+
+  /**
+   * Terminal fallback: every account is unavailable. Reactivate and return the
+   * one that resets soonest, if its reset time has already passed.
+   */
+  _selectSoonestReset() {
+    let soonestAccount = null;
+    let soonestTime = Infinity;
+    for (const account of this.accounts) {
+      const resetTime = account.rateLimitedUntil
+        || account.quota.unified5hReset
+        || account.quota.unified7dReset
+        || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
+      if (resetTime && resetTime < soonestTime) {
+        soonestTime = resetTime;
+        soonestAccount = account;
+      }
+    }
+    if (soonestAccount && soonestTime <= Date.now()) {
+      soonestAccount.status = 'active';
+      soonestAccount.rateLimitedUntil = null;
+      this.currentIndex = soonestAccount.index;
+      console.log(`[NextClaude] Account "${soonestAccount.name}" reset, switching to it`);
+      return soonestAccount;
+    }
+    return null;
+  }
+
+  /** Drop idle / overflow sessions so the affinity map can't grow unbounded. */
+  _evictSessions() {
+    const now = Date.now();
+    for (const [k, s] of this.sessions) {
+      if (now - s.lastSeen > this._sessionTtlMs) this.sessions.delete(k);
+    }
+    if (this.sessions.size > this._maxSessions) {
+      const sorted = [...this.sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+      const drop = this.sessions.size - this._maxSessions;
+      for (let i = 0; i < drop; i++) this.sessions.delete(sorted[i][0]);
+    }
   }
 
   _isAvailable(account) {
@@ -115,44 +278,16 @@ export class AccountManager {
   }
 
   _selectNext() {
-    const startIndex = this.currentIndex;
-
-    for (let i = 1; i <= this.accounts.length; i++) {
-      const idx = (startIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
-
-      if (this._isAvailable(account)) {
-        this.currentIndex = idx;
-        console.log(`[NextClaude] Switched to account "${account.name}"`);
-        return account;
-      }
+    // Lever B: pick the account with the most remaining quota rather than the
+    // next one round-robin (which could land on an almost-full account and
+    // force another rebuild moments later).
+    const next = this._selectBest();
+    if (next) {
+      this.currentIndex = next.index;
+      console.log(`[NextClaude] Switched to account "${next.name}"`);
+      return next;
     }
-
-    // All accounts unavailable — find the one that resets soonest
-    let soonestAccount = null;
-    let soonestTime = Infinity;
-
-    for (const account of this.accounts) {
-      const resetTime = account.rateLimitedUntil
-        || account.quota.unified5hReset
-        || account.quota.unified7dReset
-        || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
-
-      if (resetTime && resetTime < soonestTime) {
-        soonestTime = resetTime;
-        soonestAccount = account;
-      }
-    }
-
-    if (soonestAccount && soonestTime <= Date.now()) {
-      soonestAccount.status = 'active';
-      soonestAccount.rateLimitedUntil = null;
-      this.currentIndex = soonestAccount.index;
-      console.log(`[NextClaude] Account "${soonestAccount.name}" reset, switching to it`);
-      return soonestAccount;
-    }
-
-    return null;
+    return this._selectSoonestReset();
   }
 
   /**
@@ -208,12 +343,26 @@ export class AccountManager {
 
   /**
    * Update cumulative token usage from response body data.
+   * cacheCreation/cacheRead come from the Anthropic usage object and let us
+   * see (and later, in Layer 2, time switches against) the real rebuild cost.
    */
-  updateUsage(accountIndex, inputTokens, outputTokens) {
+  updateUsage(accountIndex, inputTokens, outputTokens, cacheCreation = 0, cacheRead = 0) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    if (inputTokens) account.usage.totalInputTokens += inputTokens;
-    if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    const u = account.usage;
+    if (inputTokens) u.totalInputTokens += inputTokens;
+    if (outputTokens) u.totalOutputTokens += outputTokens;
+    if (cacheCreation) {
+      u.totalCacheCreationTokens += cacheCreation;
+      u.lastCacheCreationTokens = cacheCreation;
+      // A large cache_creation with little/no cache_read is a cold rebuild —
+      // i.e. this request landed on an org that didn't hold the prefix.
+      if (cacheCreation > 0 && (!cacheRead || cacheCreation > cacheRead)) {
+        u.totalSwitchRebuilds++;
+      }
+    }
+    if (cacheRead != null) u.lastCacheReadTokens = cacheRead;
+    if (cacheRead) u.totalCacheReadTokens += cacheRead;
   }
 
   /**
@@ -306,7 +455,7 @@ export class AccountManager {
       expiresAt: acctData.expiresAt || null,
       status: 'active',
       quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
+      usage: emptyUsage(),
       rateLimitedUntil: null,
     });
     return index;
@@ -333,6 +482,7 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      activeSessions: this.sessions.size,
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

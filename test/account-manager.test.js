@@ -1,0 +1,146 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { AccountManager } from '../src/account-manager.js';
+import { deriveSessionKey } from '../src/server.js';
+
+function makeManager(names = ['a', 'b', 'c'], threshold = 0.98) {
+  return new AccountManager(
+    names.map((n, i) => ({ name: n, type: 'apikey', apiKey: `key-${i}` })),
+    threshold,
+  );
+}
+
+// Drive an account near/over the switch threshold (Claude Max unified path).
+function exhaust(am, name) {
+  const a = am.accounts.find(x => x.name === name);
+  a.quota.unified5h = 0.99;
+}
+function reset(am, name) {
+  const a = am.accounts.find(x => x.name === name);
+  a.quota.unified5h = null;
+  a.quota.unified5hReset = null;
+}
+function setUtil(am, name, u) {
+  am.accounts.find(x => x.name === name).quota.unified5h = u;
+}
+
+test('session affinity: same key sticks to one account', () => {
+  const am = makeManager();
+  const first = am.getActiveAccount('s1');
+  assert.equal(am.getActiveAccount('s1').name, first.name);
+  assert.equal(am.getActiveAccount('s1').name, first.name);
+});
+
+test('forced switch is forward-only and the old account is never re-selected', () => {
+  const am = makeManager();
+  const a = am.getActiveAccount('s1');           // pins lowest-util -> 'a'
+  assert.equal(a.name, 'a');
+
+  exhaust(am, 'a');
+  const b = am.getActiveAccount('s1');           // burn 'a', switch forward
+  assert.notEqual(b.name, 'a');
+
+  // 'a' resets and is now the freshest account again...
+  reset(am, 'a');
+  // ...but the session must NOT switch back to it (its cache is cold).
+  assert.equal(am.getActiveAccount('s1').name, b.name);
+});
+
+test('concurrent sessions do not flip each other (per-session pins)', () => {
+  const am = makeManager();
+  setUtil(am, 'a', 0.1);
+  setUtil(am, 'b', 0.2);
+  setUtil(am, 'c', 0.3);
+
+  assert.equal(am.getActiveAccount('s1').name, 'a'); // argmin
+  assert.equal(am.getActiveAccount('s2').name, 'a'); // sharing 'a' is fine
+
+  exhaust(am, 'a');
+  assert.equal(am.getActiveAccount('s1').name, 'b'); // both move forward
+  assert.equal(am.getActiveAccount('s2').name, 'b');
+
+  setUtil(am, 'b', 0.5); // 'b' mid-usage but still serviceable
+  // interleaving s2 must not move s1's pin
+  assert.equal(am.getActiveAccount('s2').name, 'b');
+  assert.equal(am.getActiveAccount('s1').name, 'b');
+});
+
+test('forced switch picks the lowest-utilization account, not round-robin', () => {
+  const am = makeManager(['a', 'b', 'c']);
+  setUtil(am, 'a', 0.99); // current/exhausted
+  setUtil(am, 'b', 0.80);
+  setUtil(am, 'c', 0.10); // most headroom
+  am.sessions.set('s1', { pinned: 'a', burned: new Set(), lastSeen: Date.now() });
+  assert.equal(am.getActiveAccount('s1').name, 'c');
+});
+
+test('all-burned fallback: returns null when truly exhausted, recovers after reset', () => {
+  const am = makeManager(['x', 'y']);
+  assert.equal(am.getActiveAccount('s').name, 'x');
+  exhaust(am, 'x');
+  assert.equal(am.getActiveAccount('s').name, 'y'); // burn x
+  exhaust(am, 'y');
+  assert.equal(am.getActiveAccount('s'), null);     // all burned + exhausted
+
+  reset(am, 'x'); // x's window resets
+  assert.equal(am.getActiveAccount('s').name, 'x'); // cleared burn set, recovers
+});
+
+test('legacy path (no session key) still routes', () => {
+  const am = makeManager();
+  assert.equal(am.getActiveAccount().name, 'a');
+  exhaust(am, 'a');
+  assert.notEqual(am.getActiveAccount().name, 'a');
+});
+
+test('cache-token accounting and cold-rebuild detection', () => {
+  const am = makeManager();
+  // cold rebuild: large creation, little read
+  am.updateUsage(0, 100, 50, 2000, 100);
+  let u = am.accounts[0].usage;
+  assert.equal(u.totalCacheCreationTokens, 2000);
+  assert.equal(u.totalCacheReadTokens, 100);
+  assert.equal(u.lastCacheReadTokens, 100);
+  assert.equal(u.totalSwitchRebuilds, 1);
+
+  // warm read: no creation -> not counted as a rebuild
+  am.updateUsage(0, 100, 50, 0, 5000);
+  u = am.accounts[0].usage;
+  assert.equal(u.totalCacheReadTokens, 5100);
+  assert.equal(u.totalSwitchRebuilds, 1);
+  assert.equal(u.lastCacheReadTokens, 5000);
+});
+
+test('session map evicts idle entries past TTL', () => {
+  const am = makeManager();
+  am.getActiveAccount('old');
+  // backdate it beyond the TTL, then touch a new session to trigger eviction
+  am.sessions.get('old').lastSeen = Date.now() - am._sessionTtlMs - 1000;
+  am.getActiveAccount('fresh');
+  assert.equal(am.sessions.has('old'), false);
+  assert.equal(am.sessions.has('fresh'), true);
+});
+
+// ── deriveSessionKey ──────────────────────────────────────────
+
+test('deriveSessionKey is stable across a growing conversation', () => {
+  const base = {
+    model: 'claude-opus-4-8',
+    system: 'You are helpful.',
+    tools: [{ name: 'Read' }, { name: 'Bash' }],
+    messages: [{ role: 'user', content: 'first task' }],
+  };
+  const k1 = deriveSessionKey(Buffer.from(JSON.stringify(base)));
+  const grown = { ...base, messages: [base.messages[0], { role: 'assistant', content: 'ok' }, { role: 'user', content: 'next' }] };
+  const k2 = deriveSessionKey(Buffer.from(JSON.stringify(grown)));
+  assert.equal(k1, k2); // tail growth must not change the key
+});
+
+test('deriveSessionKey distinguishes different conversations and rejects non-chat bodies', () => {
+  const a = deriveSessionKey(Buffer.from(JSON.stringify({ model: 'm', system: 's', tools: [], messages: [{ role: 'user', content: 'A' }] })));
+  const b = deriveSessionKey(Buffer.from(JSON.stringify({ model: 'm', system: 's', tools: [], messages: [{ role: 'user', content: 'B' }] })));
+  assert.notEqual(a, b);
+  assert.equal(deriveSessionKey(Buffer.from('not json')), null);
+  assert.equal(deriveSessionKey(Buffer.from(JSON.stringify({ foo: 1 }))), null);
+  assert.equal(deriveSessionKey(Buffer.alloc(0)), null);
+});

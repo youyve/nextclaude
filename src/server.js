@@ -1,12 +1,41 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+
+/**
+ * Derive a stable per-conversation key from the request body so the proxy can
+ * pin a conversation to one account (Layer 1 affinity). We hash only the STABLE
+ * prefix — model + system prompt + tool definitions + the first message — which
+ * does not change as the conversation grows, so every turn of one conversation
+ * maps to the same key. Hashing the growing message tail instead would re-key
+ * every turn and defeat affinity. Returns null for non-JSON or non-chat bodies,
+ * in which case the caller falls back to global routing.
+ */
+export function deriveSessionKey(body) {
+  if (!body || body.length === 0) return null;
+  try {
+    const j = JSON.parse(body.toString());
+    if (!j || !Array.isArray(j.messages) || j.messages.length === 0) return null;
+    const h = createHash('sha256');
+    h.update(j.model || '');
+    h.update('\0');
+    h.update(typeof j.system === 'string' ? j.system : JSON.stringify(j.system || ''));
+    h.update('\0');
+    h.update(JSON.stringify((j.tools || []).map(t => t?.name)));
+    h.update('\0');
+    h.update(JSON.stringify(j.messages[0]));
+    return h.digest('hex').slice(0, 32);
+  } catch {
+    return null;
+  }
+}
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -59,9 +88,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
 
+      // Compute the session key once here (not inside the retry recursion) so
+      // every retry of this request routes to the same pinned account.
+      const sessionKey = deriveSessionKey(body);
+
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sessionKey);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[NextClaude] Unhandled error:', err);
@@ -147,11 +180,11 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sessionKey = null) {
   const maxRetries = accountManager.accounts.length;
 
-  // Select account
-  const account = accountManager.getActiveAccount();
+  // Select account — sessionKey pins this conversation to its warm account.
+  const account = accountManager.getActiveAccount(sessionKey);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -178,7 +211,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
   }
 
   // Build upstream request headers
@@ -257,7 +290,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sessionKey);
     }
 
     // Log response headers
@@ -330,7 +363,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (retryCount < maxRetries && !res.headersSent) {
       account.status = 'error';
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
     }
     ctx.status = 502;
 
@@ -406,7 +439,11 @@ function parseSSEUsage(event, accountIndex, accountManager) {
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      const u = data.message.usage;
+      accountManager.updateUsage(
+        accountIndex, u.input_tokens, 0,
+        u.cache_creation_input_tokens || 0, u.cache_read_input_tokens || 0,
+      );
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
     }
@@ -419,7 +456,10 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(
+        accountIndex, json.usage.input_tokens, json.usage.output_tokens,
+        json.usage.cache_creation_input_tokens || 0, json.usage.cache_read_input_tokens || 0,
+      );
     }
   } catch {
     // not JSON or no usage
