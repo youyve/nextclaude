@@ -61,6 +61,18 @@ export class AccountManager {
     this.sessions = new Map();
     this._sessionTtlMs = 30 * 60 * 1000; // forget idle conversations after 30m
     this._maxSessions = 2000;
+
+    // Layer 2 — compaction-aware lazy switching.
+    // switchThreshold (soft, ~0.98) only ARMS a session: once a pinned account
+    // crosses it we are eligible to switch, but we defer and ride the warm cache,
+    // waiting for the client to auto-compact (a sharp drop in request body size)
+    // so the unavoidable rebuild lands on a small prefix instead of the peak.
+    // hardThreshold (and a 'rejected' status / real quota-429) is the backstop:
+    // we switch immediately regardless of context, so deferral is never worse
+    // than the old eager 0.98 switch and never causes a user-visible rejection.
+    this.hardThreshold = 0.995;
+    this._troughDropRatio = 0.5;      // switch when context shrinks below 50% of its peak
+    this._troughMinPeakBytes = 50000; // ignore tiny conversations (~12K tokens)
   }
 
   /**
@@ -80,7 +92,7 @@ export class AccountManager {
    * Without a sessionKey (non-JSON body / fallback) it keeps the legacy global
    * behavior. Returns null if all accounts are exhausted.
    */
-  getActiveAccount(sessionKey = null) {
+  getActiveAccount(sessionKey = null, contextSize = null) {
     if (!sessionKey) {
       const current = this.accounts[this.currentIndex];
       if (this._isAvailable(current)) return current;
@@ -89,40 +101,92 @@ export class AccountManager {
 
     let sess = this.sessions.get(sessionKey);
     if (!sess) {
-      sess = { pinned: null, burned: new Set(), lastSeen: Date.now() };
+      sess = { pinned: null, burned: new Set(), lastSeen: Date.now(), ctxPeak: null };
       this.sessions.set(sessionKey, sess);
       this._evictSessions();
     }
     sess.lastSeen = Date.now();
 
-    // Stay on the pinned account while it can still serve.
     const pinned = sess.pinned ? this._byIdentity(sess.pinned) : null;
     if (pinned && this._isAvailable(pinned)) {
       this.currentIndex = pinned.index;
+
+      // Layer 2: the pinned account is past the soft threshold and will have to
+      // be left soon. Defer that switch and ride the warm cache until the client
+      // auto-compacts — detected as a sharp drop in request size — so the
+      // unavoidable rebuild lands on the small post-compaction prefix. Only
+      // pre-empt if there is a meaningfully fresher account to move to.
+      if (this._inWarningZone(pinned) && this._detectTrough(sess, contextSize)) {
+        const exclude = new Set(sess.burned);
+        exclude.add(sess.pinned);
+        const better = this._selectBest(exclude);
+        if (better && this._utilization(better) < this._utilization(pinned) - 0.1) {
+          console.log(`[NextClaude] Compaction trough — switching session "${this._shortKey(sessionKey)}" → "${better.name}" to shrink the rebuild`);
+          sess.burned.add(sess.pinned);
+          sess.pinned = this._identity(better);
+          sess.ctxPeak = contextSize;
+          this.currentIndex = better.index;
+          return better;
+        }
+      }
       return pinned;
     }
 
-    // Pinned account is exhausted/gone: burn it (never come back) and switch
-    // forward to the available account with the most remaining quota.
+    // Pinned account hit the hard ceiling / is gone: switch forward.
+    return this._switchSession(sess, sessionKey, contextSize);
+  }
+
+  /**
+   * Move a session off its (exhausted) pinned account. Burns it so we never
+   * switch back to its cold cache, picks the most-headroom non-burned account,
+   * and only as a last resort (all burned) clears the set and falls back to the
+   * soonest-resetting account — preserving the terminal all-exhausted path.
+   */
+  _switchSession(sess, sessionKey, contextSize = null) {
     if (sess.pinned) sess.burned.add(sess.pinned);
     let next = this._selectBest(sess.burned);
-
-    // All non-burned accounts are unavailable. Only now do we accept an
-    // unavoidable rebuild on a reset account — clear the burn set and fall back
-    // to the soonest-resetting account (preserves the terminal all-exhausted path).
     if (!next) {
       sess.burned.clear();
       next = this._selectBest() || this._selectSoonestReset();
     }
-
     if (next) {
       if (sess.pinned && sess.pinned !== this._identity(next)) {
         console.log(`[NextClaude] Session switched "${this._shortKey(sessionKey)}" → "${next.name}"`);
       }
       sess.pinned = this._identity(next);
+      sess.ctxPeak = contextSize;
       this.currentIndex = next.index;
     }
     return next;
+  }
+
+  /**
+   * Detect a client-side auto-compaction: the request body (a free proxy for
+   * context size) dropping sharply below this session's running peak. Because
+   * the client resends the FULL history each turn, a short reply like "yes"
+   * still carries the whole prefix and does NOT shrink the body — only a real
+   * compaction does. Rebaselines on detection so it fires once per compaction.
+   */
+  _detectTrough(sess, contextSize) {
+    if (contextSize == null) return false;
+    if (sess.ctxPeak == null) { sess.ctxPeak = contextSize; return false; }
+    if (contextSize > sess.ctxPeak) { sess.ctxPeak = contextSize; return false; }
+    if (sess.ctxPeak >= this._troughMinPeakBytes && contextSize < sess.ctxPeak * this._troughDropRatio) {
+      sess.ctxPeak = contextSize; // rebaseline so we don't keep firing on the small prefix
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Public: is a just-received 429 a genuine quota rejection (switch accounts)
+   * rather than a transient burst limit (wait and retry the same account)?
+   */
+  isQuotaRejection(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (!a) return false;
+    this._clearExpiredQuotas(a);
+    return this._mustSwitch(a) || this._inWarningZone(a);
   }
 
   // ── Layer 1 helpers ──────────────────────────────────
@@ -216,6 +280,12 @@ export class AccountManager {
     }
   }
 
+  /**
+   * Can this account serve a request at all right now? An account in the soft
+   * warning zone is still "available" — Layer 2 keeps using it deliberately and
+   * decides when to switch in getActiveAccount(). Only the hard ceiling (or an
+   * error/exhausted/throttled status) makes it unavailable.
+   */
   _isAvailable(account) {
     if (!account) return false;
 
@@ -228,16 +298,16 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    this._clearExpiredQuotas(account);
+    if (this._mustSwitch(account)) return false;
 
     return true;
   }
 
-  _isNearQuota(account) {
+  /** Reset utilization tracking once a quota window's reset time has passed. */
+  _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
-
-    // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[NextClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
@@ -249,8 +319,6 @@ export class AccountManager {
       q.unified7dReset = null;
       q.unifiedStatus = null;
     }
-
-    // Clear expired standard quotas
     if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
       q.tokensRemaining = null;
       q.tokensLimit = null;
@@ -258,23 +326,21 @@ export class AccountManager {
       q.requestsLimit = null;
       q.resetsAt = null;
     }
+  }
 
-    // Unified quotas (Claude Max) — utilization is already 0-1
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
+  /** Soft signal: account has crossed switchThreshold and is switch-eligible. */
+  _inWarningZone(account) {
+    this._clearExpiredQuotas(account);
+    return this._utilization(account) >= this.switchThreshold;
+  }
 
-    // Standard quotas (API key accounts)
-    if (q.tokensLimit != null && q.tokensRemaining != null) {
-      const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.switchThreshold) return true;
-    }
-
-    if (q.requestsLimit != null && q.requestsRemaining != null) {
-      const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.switchThreshold) return true;
-    }
-
-    return false;
+  /**
+   * Hard backstop: switch NOW regardless of context. True on an explicit
+   * 'rejected' rate-limit status or once utilization reaches hardThreshold.
+   */
+  _mustSwitch(account) {
+    if (account.quota.unifiedStatus === 'rejected') return true;
+    return this._utilization(account) >= this.hardThreshold;
   }
 
   _selectNext() {
@@ -330,14 +396,11 @@ export class AccountManager {
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
-    // Log when approaching quota
-    if (this._isNearQuota(account)) {
-      const pct = account.quota.unified7d != null
-        ? (account.quota.unified7d * 100).toFixed(1)
-        : account.quota.tokensLimit
-          ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
-          : '?';
-      console.log(`[NextClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    // Log when entering the warning zone (armed for a compaction-timed switch)
+    if (this._inWarningZone(account)) {
+      const pct = (this._utilization(account) * 100).toFixed(1);
+      const note = this._mustSwitch(account) ? 'at hard limit — switching now' : 'armed — will switch at next compaction or hard limit';
+      console.log(`[NextClaude] Account "${account.name}" at ${pct}% usage — ${note}`);
     }
   }
 

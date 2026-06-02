@@ -184,7 +184,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const maxRetries = accountManager.accounts.length;
 
   // Select account — sessionKey pins this conversation to its warm account.
-  const account = accountManager.getActiveAccount(sessionKey);
+  // body.length is a free, accurate proxy for context size: Claude Code resends
+  // the full history every turn, so a sharp drop marks a client auto-compaction.
+  const account = accountManager.getActiveAccount(sessionKey, body.length);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -276,17 +278,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+      // updateQuota() above already folded this 429's rate-limit headers in, so
+      // we can tell a genuine quota exhaustion ('rejected' / at-ceiling) from a
+      // transient burst limit. On exhaustion: throttle this account and switch
+      // (Layer 2 hard backstop) — affinity will pin the session to a fresh
+      // account on the retry. On a transient limit: keep the warm cache and wait.
+      if (accountManager.isQuotaRejection(account.index) && retryCount < maxRetries) {
+        accountManager.markRateLimited(account.index, retryAfter);
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 (quota exhausted) — switching account ===\n${formatHeaders(upstreamRes.headers)}`);
+        }
+        console.log(`[NextClaude] 429 quota-exhausted on "${account.name}" — switching account`);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
       }
-      console.log(`[NextClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE 429 (transient) — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+      }
+      console.log(`[NextClaude] 429 (transient) on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
       if (res.destroyed) return;

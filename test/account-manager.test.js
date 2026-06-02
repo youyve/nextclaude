@@ -10,10 +10,11 @@ function makeManager(names = ['a', 'b', 'c'], threshold = 0.98) {
   );
 }
 
-// Drive an account near/over the switch threshold (Claude Max unified path).
+// Drive an account past the HARD ceiling so it must be switched off immediately
+// (Layer 2: 0.98 only arms; 0.995+ / 'rejected' forces the switch).
 function exhaust(am, name) {
   const a = am.accounts.find(x => x.name === name);
-  a.quota.unified5h = 0.99;
+  a.quota.unified5h = 0.999;
 }
 function reset(am, name) {
   const a = am.accounts.find(x => x.name === name);
@@ -67,10 +68,10 @@ test('concurrent sessions do not flip each other (per-session pins)', () => {
 
 test('forced switch picks the lowest-utilization account, not round-robin', () => {
   const am = makeManager(['a', 'b', 'c']);
-  setUtil(am, 'a', 0.99); // current/exhausted
+  setUtil(am, 'a', 0.999); // current, hard-limited
   setUtil(am, 'b', 0.80);
   setUtil(am, 'c', 0.10); // most headroom
-  am.sessions.set('s1', { pinned: 'a', burned: new Set(), lastSeen: Date.now() });
+  am.sessions.set('s1', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
   assert.equal(am.getActiveAccount('s1').name, 'c');
 });
 
@@ -119,6 +120,69 @@ test('session map evicts idle entries past TTL', () => {
   am.getActiveAccount('fresh');
   assert.equal(am.sessions.has('old'), false);
   assert.equal(am.sessions.has('fresh'), true);
+});
+
+// ── Layer 2: compaction-aware lazy switching ──────────────────
+
+test('warning zone defers: stays on the warm account while context stays large', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.985); // armed (>=0.98) but below the 0.995 hard ceiling
+  setUtil(am, 'b', 0.0);   // a much fresher account is available
+  am.sessions.set('s', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
+
+  // Large, non-shrinking context (incl. a "yes"-style tiny reply that does not
+  // shrink the resent full history): must NOT switch despite a fresher account.
+  assert.equal(am.getActiveAccount('s', 200000).name, 'a');
+  assert.equal(am.getActiveAccount('s', 210000).name, 'a');
+  assert.equal(am.getActiveAccount('s', 200100).name, 'a');
+});
+
+test('compaction trough switches early to shrink the rebuild', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.985);
+  setUtil(am, 'b', 0.0);
+  am.sessions.set('s', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
+
+  assert.equal(am.getActiveAccount('s', 200000).name, 'a'); // sets the peak
+  // Client auto-compacts: body collapses well below half the peak -> switch now.
+  assert.equal(am.getActiveAccount('s', 30000).name, 'b');
+});
+
+test('trough does not switch when there is no meaningfully fresher account', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.985);
+  setUtil(am, 'b', 0.98); // also armed — not worth a rebuild to move here
+  am.sessions.set('s', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
+  am.getActiveAccount('s', 200000);
+  assert.equal(am.getActiveAccount('s', 30000).name, 'a'); // stays put, rides to hard ceiling
+});
+
+test('hard ceiling overrides deferral regardless of context', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.999); // hard-limited
+  setUtil(am, 'b', 0.0);
+  am.sessions.set('s', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: 200000 });
+  assert.equal(am.getActiveAccount('s', 200000).name, 'b'); // big stable context, still switches
+});
+
+test("'rejected' status forces a switch even below the utilization ceiling", () => {
+  const am = makeManager(['a', 'b']);
+  am.accounts.find(x => x.name === 'a').quota.unifiedStatus = 'rejected';
+  am.sessions.set('s', { pinned: 'a', burned: new Set(), lastSeen: Date.now(), ctxPeak: 200000 });
+  assert.equal(am.getActiveAccount('s', 200000).name, 'b');
+});
+
+test('isQuotaRejection distinguishes quota exhaustion from a transient 429', () => {
+  const am = makeManager(['a']);
+  setUtil(am, 'a', 0.5);
+  assert.equal(am.isQuotaRejection(0), false);  // transient burst -> wait
+  setUtil(am, 'a', 0.98);
+  assert.equal(am.isQuotaRejection(0), true);   // armed -> treat as exhaustion
+  setUtil(am, 'a', 0.999);
+  assert.equal(am.isQuotaRejection(0), true);
+  setUtil(am, 'a', 0.1);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  assert.equal(am.isQuotaRejection(0), true);
 });
 
 // ── deriveSessionKey ──────────────────────────────────────────
