@@ -4,16 +4,16 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  if (process.env.NEXTCLAUDE_CONFIG) return process.env.NEXTCLAUDE_CONFIG;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  return join(configDir, 'nextclaude.json');
 }
 
 export function createDefaultConfig() {
   return {
     proxy: {
       port: 3456,
-      apiKey: 'tc-' + randomBytes(24).toString('base64url'),
+      apiKey: 'nc-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
@@ -50,7 +50,7 @@ export async function saveConfig(config) {
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * made by other processes (e.g. `nextclaude import` while the server runs).
  */
 export async function atomicConfigUpdate(updater) {
   const config = await loadConfig() || createDefaultConfig();

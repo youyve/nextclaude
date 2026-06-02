@@ -61,7 +61,7 @@ export class AccountManager {
       if (Date.now() < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      console.log(`[NextClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
@@ -76,12 +76,12 @@ export class AccountManager {
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      console.log(`[NextClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+      console.log(`[NextClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -123,7 +123,7 @@ export class AccountManager {
 
       if (this._isAvailable(account)) {
         this.currentIndex = idx;
-        console.log(`[TeamClaude] Switched to account "${account.name}"`);
+        console.log(`[NextClaude] Switched to account "${account.name}"`);
         return account;
       }
     }
@@ -148,7 +148,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
-      console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
+      console.log(`[NextClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
 
@@ -202,7 +202,7 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+      console.log(`[NextClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
   }
 
@@ -224,7 +224,7 @@ export class AccountManager {
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    console.log(`[NextClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
   }
 
   /**
@@ -242,16 +242,16 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
+      console.log(`[NextClaude] Refreshing token for account "${account.name}"...`);
       try {
         const newTokens = await refreshAccessToken(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
-        console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
+        console.log(`[NextClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
-        console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        console.error(`[NextClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
@@ -283,7 +283,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
-    console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
+    console.log(`[NextClaude] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,

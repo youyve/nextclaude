@@ -74,9 +74,9 @@ async function serverCommand() {
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
-    console.error('  teamclaude import           Import from Claude Code');
-    console.error('  teamclaude login            OAuth login via browser');
-    console.error('  teamclaude login --api      Add an API key');
+    console.error('  nextclaude import           Import from Claude Code');
+    console.error('  nextclaude login            OAuth login via browser');
+    console.error('  nextclaude login --api      Add an API key');
     process.exit(1);
   }
 
@@ -90,7 +90,7 @@ async function serverCommand() {
   const accountManager = new AccountManager(accounts, threshold);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
-  // accounts added externally, e.g. by `teamclaude import` while server is running)
+  // accounts added externally, e.g. by `nextclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
@@ -118,7 +118,7 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
       }
-    }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    }).catch(err => console.error(`[NextClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
@@ -171,7 +171,7 @@ async function serverCommand() {
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
-      console.log('  TeamClaude Proxy');
+      console.log('  NextClaude Proxy');
       console.log(sep);
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
@@ -182,8 +182,8 @@ async function serverCommand() {
         console.log(`  [${i + 1}] ${a.name} (${a.type})`);
       });
       console.log('');
-      console.log('  Run Claude through proxy:  teamclaude run');
-      console.log('  Show env vars:             teamclaude env');
+      console.log('  Run Claude through proxy:  nextclaude run');
+      console.log('  Show env vars:             nextclaude env');
       console.log(sep);
       console.log('');
     }
@@ -191,11 +191,11 @@ async function serverCommand() {
 
   if (!tui) {
     process.on('SIGINT', () => {
-      console.log('\n[TeamClaude] Shutting down...');
+      console.log('\n[NextClaude] Shutting down...');
       server.close(() => process.exit(0));
     });
     process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
+      console.log('\n[NextClaude] Shutting down...');
       server.close(() => process.exit(0));
     });
   }
@@ -314,8 +314,8 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  teamclaude import        Import from existing Claude Code credentials');
-    console.error('  teamclaude login --api   Add an API key instead');
+    console.error('  nextclaude import        Import from existing Claude Code credentials');
+    console.error('  nextclaude login --api   Add an API key instead');
     process.exit(1);
   }
 
@@ -367,7 +367,7 @@ async function runCommand() {
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  const url = `http://localhost:${config.proxy.port}/nextclaude/status`;
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
@@ -399,7 +399,7 @@ async function statusCommand() {
     }
   } catch {
     console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
-    console.error('Is the server running? Start with: teamclaude server');
+    console.error('Is the server running? Start with: nextclaude server');
     process.exit(1);
   }
 }
@@ -412,7 +412,7 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
+    console.log('Add one with: nextclaude import, nextclaude login, or nextclaude login --api');
     return;
   }
 
@@ -503,8 +503,8 @@ async function apiCommand() {
   const path = args[1];
 
   if (!path) {
-    console.error('Usage: teamclaude api <path> [--account NAME] [--method POST] [--data JSON]');
-    console.error('Example: teamclaude api /api/oauth/claude_cli/roles');
+    console.error('Usage: nextclaude api <path> [--account NAME] [--method POST] [--data JSON]');
+    console.error('Example: nextclaude api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
 
@@ -563,7 +563,7 @@ async function removeCommand() {
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name>');
+    console.error('Usage: nextclaude remove <account-name>');
     process.exit(1);
   }
 
@@ -581,9 +581,9 @@ async function removeCommand() {
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
-  console.log(`TeamClaude - Multi-account Claude proxy
+  console.log(`NextClaude - Multi-account Claude proxy
 
-Usage: teamclaude [command] [options]
+Usage: nextclaude [command] [options]
 
 Commands:
   server              Start the proxy server (default)
@@ -688,7 +688,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
       added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      console.log(`[NextClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
 
@@ -699,7 +699,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         const creds = await importCredentials(diskAcct.importFrom);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
       } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
+        console.error(`[NextClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
@@ -724,12 +724,12 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
+        console.log(`[NextClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      console.log(`[NextClaude] Updated API key for "${mgr.name}"`);
     }
   }
   return added;

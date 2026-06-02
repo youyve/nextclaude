@@ -34,7 +34,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
 
       // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      if (req.method === 'GET' && req.url === '/nextclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
         return;
@@ -64,7 +64,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
+        console.error('[NextClaude] Unhandled error:', err);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -79,7 +79,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      console.error('[NextClaude] Unhandled error:', err);
     }
   });
 
@@ -114,7 +114,7 @@ async function relayRaw(req, res, upstream) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Raw relay error:', err.message);
+    console.error('[NextClaude] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -136,7 +136,7 @@ async function writeRequestLog(logDir, reqId, sections) {
   try {
     await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
   } catch (err) {
-    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
+    console.error(`[NextClaude] Failed to write log: ${err.message}`);
   }
 }
 
@@ -253,7 +253,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (logDir) {
         logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
+      console.log(`[NextClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
       if (res.destroyed) return;
@@ -310,7 +310,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       res.end(buf);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[NextClaude] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);

@@ -1,11 +1,11 @@
 {
-  "name": "@karpeleslab/teamclaude",
+  "name": "nextclaude",
   "version": "1.0.6",
   "description": "Multi-account Claude proxy with automatic quota-based rotation",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamclaude": "src/index.js"
+    "nextclaude": "src/index.js"
   },
   "files": [
     "src/"

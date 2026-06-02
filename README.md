@@ -1,10 +1,10 @@
-# TeamClaude
+# NextClaude
 
 Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
 
 Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
 
-![TeamClaude TUI](screenshots/teamclaude.png)
+![NextClaude TUI](screenshots/nextclaude.png)
 
 ## Features
 
@@ -23,26 +23,26 @@ Requires Node.js 18+.
 
 ```bash
 # Install
-npm install -g @karpeleslab/teamclaude
+npm install -g nextclaude
 
 # Add your first account (opens browser for OAuth)
-teamclaude login
+nextclaude login
 
 # Add a second account
-teamclaude login
+nextclaude login
 
 # Start the proxy
-teamclaude server
+nextclaude server
 
 # In another terminal, run Claude Code through the proxy
-teamclaude run
+nextclaude run
 ```
 
 You can also import existing Claude Code credentials instead of logging in:
 
 ```bash
 claude /login           # Log into an account in Claude Code
-teamclaude import       # Import its credentials
+nextclaude import       # Import its credentials
 ```
 
 ## Adding Accounts
@@ -52,7 +52,7 @@ teamclaude import       # Import its credentials
 The easiest way to add accounts — opens your browser for authentication:
 
 ```bash
-teamclaude login
+nextclaude login
 ```
 
 Uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
@@ -65,13 +65,13 @@ If you already have Claude Code set up, you can import its credentials directly:
 
 ```bash
 claude /login           # Log into an account in Claude Code
-teamclaude import       # Import its credentials
+nextclaude import       # Import its credentials
 ```
 
 Re-importing the same account updates its credentials. You can also import from a custom path:
 
 ```bash
-teamclaude import --from /path/to/credentials.json
+nextclaude import --from /path/to/credentials.json
 ```
 
 ### API Key
@@ -79,7 +79,7 @@ teamclaude import --from /path/to/credentials.json
 For Anthropic API key accounts (billed via Console):
 
 ```bash
-teamclaude login --api
+nextclaude login --api
 ```
 
 ## Usage
@@ -87,7 +87,7 @@ teamclaude login --api
 ### Start the proxy server
 
 ```bash
-teamclaude server
+nextclaude server
 ```
 
 When running from a TTY, shows an interactive TUI with:
@@ -112,25 +112,25 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 ### Run Claude Code through the proxy
 
 ```bash
-teamclaude run
+nextclaude run
 ```
 
 Or manually set the environment:
 
 ```bash
-eval $(teamclaude env)
+eval $(nextclaude env)
 claude
 ```
 
 ### Other commands
 
 ```bash
-teamclaude accounts          # List accounts with subscription tier and token status
-teamclaude accounts -v       # Also show token expiry times
-teamclaude status            # Show live proxy status (requires running server)
-teamclaude remove <name>     # Remove an account
-teamclaude api <path>        # Call an API endpoint with account credentials
-teamclaude help              # Show all commands
+nextclaude accounts          # List accounts with subscription tier and token status
+nextclaude accounts -v       # Also show token expiry times
+nextclaude status            # Show live proxy status (requires running server)
+nextclaude remove <name>     # Remove an account
+nextclaude api <path>        # Call an API endpoint with account credentials
+nextclaude help              # Show all commands
 ```
 
 ### Request logging
@@ -138,17 +138,17 @@ teamclaude help              # Show all commands
 Log full request/response details to a directory (one file per request):
 
 ```bash
-teamclaude server --log-to /tmp/requests
+nextclaude server --log-to /tmp/requests
 ```
 
 ## Configuration
 
-Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
+Config is stored at `~/.config/nextclaude.json` (or `$XDG_CONFIG_HOME/nextclaude.json`). A random proxy API key is generated on first use.
 
-Override the config path with `TEAMCLAUDE_CONFIG`:
+Override the config path with `NEXTCLAUDE_CONFIG`:
 
 ```bash
-TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
+NEXTCLAUDE_CONFIG=./my-config.json nextclaude server
 ```
 
 ### Config format
@@ -157,7 +157,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 {
   "proxy": {
     "port": 3456,
-    "apiKey": "tc-auto-generated-key"
+    "apiKey": "nc-auto-generated-key"
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,

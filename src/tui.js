@@ -194,7 +194,7 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    msg = msg.replace(/^\[NextClaude\]\s*/, '');
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
     if (this.running) this.render();
@@ -384,7 +384,7 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' TeamClaude');
+    const left = bold(' NextClaude');
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
