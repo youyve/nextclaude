@@ -169,6 +169,19 @@ async function serverCommand() {
 
   const server = createProxyServer(accountManager, config, hooks);
 
+  // Fail gracefully instead of crashing with an unhandled 'error' event.
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`\nPort ${port} is already in use — another nextclaude server (or app) is on it.`);
+      console.error(`  • If a nextclaude server is already running, just use it.`);
+      console.error(`  • To restart, stop the other one first:  lsof -ti:${port} | xargs kill`);
+      console.error(`  • Or change "proxy.port" in ${getConfigPath()}.`);
+    } else {
+      console.error(`\nServer error: ${err.message}`);
+    }
+    process.exit(1);
+  });
+
   server.listen(port, () => {
     if (tui) {
       tui.start();
