@@ -92,3 +92,44 @@ test('end-to-end: proxy forwards, captures cache usage, and pins a session', asy
     await close(upstream);
   }
 });
+
+// Upstream that always rejects with a quota-exhaustion 429 and a long retry-after.
+function make429Upstream() {
+  return http.createServer((req, res) => {
+    let b = ''; req.on('data', c => (b += c)); req.on('end', () => {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': '3600', // an hour — the proxy must NOT hold the request this long
+        'anthropic-ratelimit-unified-5h-utilization': '0.999',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 120),
+      });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'exhausted' } }));
+    });
+  });
+}
+
+test('all accounts quota-exhausted returns 429 promptly (no endless hang)', async () => {
+  const upstream = make429Upstream();
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  try {
+    const start = Date.now();
+    const res = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+    });
+    const elapsed = Date.now() - start;
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.ok(elapsed < 5000, `returned promptly, not held open (${elapsed}ms)`);
+    const ra = Number(res.headers.get('retry-after'));
+    assert.ok(ra > 0 && ra <= 130, `retry-after reflects the ~120s reset, got ${ra}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});

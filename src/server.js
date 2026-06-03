@@ -284,27 +284,51 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       await upstreamRes.body?.cancel();
 
       // updateQuota() above already folded this 429's rate-limit headers in, so
-      // we can tell a genuine quota exhaustion ('rejected' / at-ceiling) from a
-      // transient burst limit. On exhaustion: throttle this account and switch
-      // (Layer 2 hard backstop) — affinity will pin the session to a fresh
-      // account on the retry. On a transient limit: keep the warm cache and wait.
-      if (accountManager.isQuotaRejection(account.index) && retryCount < maxRetries) {
+      // we can tell genuine quota exhaustion ('rejected' / at-ceiling) from a
+      // transient burst limit.
+      if (accountManager.isQuotaRejection(account.index)) {
         accountManager.markRateLimited(account.index, retryAfter);
-        if (logDir) {
-          logSections.push(`=== RESPONSE 429 (quota exhausted) — switching account ===\n${formatHeaders(upstreamRes.headers)}`);
+        if (retryCount < maxRetries) {
+          if (logDir) logSections.push(`=== RESPONSE 429 (quota) — switching account ===\n${formatHeaders(upstreamRes.headers)}`);
+          console.log(`[NextClaude] 429 quota-exhausted on "${account.name}" — switching account`);
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
         }
-        console.log(`[NextClaude] 429 quota-exhausted on "${account.name}" — switching account`);
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
+        // Every account is quota-exhausted. Return a 429 to the client NOW with
+        // the real time-to-reset instead of holding the connection open — the
+        // old code waited retry-after (often hours), which looked to Claude Code
+        // like an endless "cooking" spinner that never recovered.
+        ctx.status = 429;
+        const ra = computeRetryAfter(accountManager.getStatus().accounts);
+        console.log(`[NextClaude] All accounts quota-exhausted — returning 429 (retry in ${ra}s)`);
+        if (logDir) { logSections.push(`=== RESPONSE 429 (all exhausted, retry ${ra}s) ===`); writeRequestLog(logDir, reqId, logSections); }
+        if (!res.headersSent) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'rate_limit_error', message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${ra}s.` },
+          }));
+        }
+        return;
       }
 
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 (transient) — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+      // Transient burst limit: short, bounded wait then retry the SAME warm
+      // account. Cap the wait and the number of retries so a request is never
+      // held open indefinitely.
+      if (retryCount < maxRetries) {
+        const wait = Math.min(retryAfter, 60);
+        if (logDir) logSections.push(`=== RESPONSE 429 (transient) — waiting ${wait}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        console.log(`[NextClaude] 429 (transient) on "${account.name}" — waiting ${wait}s before retry`);
+        await new Promise(resolve => setTimeout(resolve, wait * 1000));
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sessionKey);
       }
-      console.log(`[NextClaude] 429 (transient) on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sessionKey);
+      ctx.status = 429;
+      if (logDir) { logSections.push(`=== RESPONSE 429 (transient, retries exhausted) ===`); writeRequestLog(logDir, reqId, logSections); }
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(Math.min(retryAfter, 60)) });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Rate limited, please retry.' } }));
+      }
+      return;
     }
 
     // Log response headers
@@ -480,14 +504,19 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   }
 }
 
-function computeRetryAfter(accounts) {
+export function computeRetryAfter(accounts) {
   let soonest = Infinity;
+  const consider = (ms) => {
+    if (ms == null) return;
+    const d = ms - Date.now();
+    if (d > 0 && d < soonest) soonest = d;
+  };
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
-    }
+    if (acct.rateLimitedUntil) consider(new Date(acct.rateLimitedUntil).getTime());
+    const q = acct.quota || {};
+    consider(q.unified5hReset);          // ms timestamps
+    consider(q.unified7dReset);
+    if (q.resetsAt) consider(new Date(q.resetsAt).getTime());
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { deriveSessionKey } from '../src/server.js';
+import { deriveSessionKey, computeRetryAfter } from '../src/server.js';
 
 function makeManager(names = ['a', 'b', 'c'], threshold = 0.98) {
   return new AccountManager(
@@ -255,6 +255,43 @@ test('chooseInitialPrimary starts on the most-remaining-quota account (the resta
   assert.equal(am.accounts[am.currentIndex].name, 'youyve', 'primary is the freshest, not config #0');
   // and a new conversation actually routes there
   assert.equal(am.getActiveAccount('news', 1000).name, 'youyve');
+});
+
+// ── rate-limit recovery (cooking-forever / stuck-bar fixes) ───
+
+test('markRateLimited is capped at the soonest quota reset', () => {
+  const am = makeManager(['a']);
+  const reset = Date.now() + 5 * 60 * 1000; // 5 min away
+  am.accounts[0].quota.unified5hReset = reset;
+  am.markRateLimited(0, 3600); // upstream said wait an hour…
+  // …but we must not park it past the actual 5h reset
+  assert.ok(am.accounts[0].rateLimitedUntil <= reset + 1);
+  assert.ok(am.accounts[0].rateLimitedUntil > Date.now());
+});
+
+test('refreshExpiredQuotas clears expired windows and lifts expired throttles', () => {
+  const am = makeManager(['a', 'b']);
+  // a: 5h window already reset in the past, but still showing old utilization
+  am.accounts[0].quota.unified5h = 0.95;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1000;
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].rateLimitedUntil = Date.now() - 1000;
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[0].quota.unified5h, null, 'expired 5h cleared');
+  assert.equal(am.accounts[0].status, 'active', 'expired throttle lifted');
+  assert.equal(am.accounts[0].rateLimitedUntil, null);
+});
+
+test('computeRetryAfter uses unified resets, not a misleading default', () => {
+  const soon = Date.now() + 90 * 1000; // 90s
+  const accounts = [
+    { rateLimitedUntil: null, quota: { unified5hReset: soon, unified7dReset: Date.now() + 86400e3 } },
+    { rateLimitedUntil: null, quota: { unified5hReset: Date.now() + 3600e3 } },
+  ];
+  const ra = computeRetryAfter(accounts);
+  assert.ok(ra >= 80 && ra <= 95, `retry-after ~90s, got ${ra}`);
+  // no reset info → falls back to 60
+  assert.equal(computeRetryAfter([{ quota: {} }]), 60);
 });
 
 // ── deriveSessionKey ──────────────────────────────────────────

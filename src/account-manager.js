@@ -497,14 +497,39 @@ export class AccountManager {
   }
 
   /**
-   * Mark an account as rate-limited for a given duration.
+   * Mark an account as rate-limited. The duration is capped at the account's
+   * soonest known quota reset so it never stays parked long after the 5h/weekly
+   * window has actually reset (which would leave it unusable after recovery).
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     account.status = 'throttled';
-    account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`[NextClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    let until = Date.now() + (retryAfterSeconds * 1000);
+    const resets = [
+      account.quota.unified5hReset,
+      account.quota.unified7dReset,
+      account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null,
+    ].filter(t => t && t > Date.now());
+    if (resets.length) until = Math.min(until, ...resets);
+    account.rateLimitedUntil = until;
+    console.log(`[NextClaude] Account "${account.name}" rate limited until ${new Date(until).toISOString()}`);
+  }
+
+  /**
+   * Drop expired quota windows and lift expired throttles across all accounts,
+   * even when idle — so the dashboard's bars reset on their own once a window
+   * rolls over, without needing a request to trigger the lazy cleanup.
+   */
+  refreshExpiredQuotas() {
+    const now = Date.now();
+    for (const a of this.accounts) {
+      this._clearExpiredQuotas(a);
+      if (a.status === 'throttled' && a.rateLimitedUntil && now >= a.rateLimitedUntil) {
+        a.status = 'active';
+        a.rateLimitedUntil = null;
+      }
+    }
   }
 
   /**

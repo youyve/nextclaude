@@ -393,6 +393,8 @@ export class TUI {
 
   render() {
     if (!this.running) return;
+    // Clear expired quota windows even while idle so bars reset on their own.
+    this.am.refreshExpiredQuotas?.();
     const W = process.stdout.columns || 80;
     const H = process.stdout.rows || 24;
 

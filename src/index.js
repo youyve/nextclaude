@@ -218,8 +218,12 @@ async function serverCommand() {
   // background so the dashboard can show Max/Pro without delaying startup.
   fetchTiers(accountManager, tui);
 
-  // Persist quota/usage periodically so a restart can resume from real data.
-  const stateTimer = setInterval(() => { saveState(accountManager.exportState()); }, 15000);
+  // Periodically clear expired quota windows (so headless mode + saved state
+  // reflect resets) and persist quota/usage so a restart resumes from real data.
+  const stateTimer = setInterval(() => {
+    accountManager.refreshExpiredQuotas();
+    saveState(accountManager.exportState());
+  }, 15000);
   stateTimer.unref();
 
   let shuttingDown = false;
