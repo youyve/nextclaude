@@ -1,7 +1,7 @@
 {
   "name": "nextclaude",
   "version": "1.0.6",
-  "description": "Multi-account Claude proxy with automatic quota-based rotation",
+  "description": "Multi-account Claude Code proxy with quota-based rotation and prompt-cache-aware account switching",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -22,6 +22,15 @@
     "multi-account"
   ],
   "license": "MIT",
+  "author": "youlz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/youyve/nextclaude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/youyve/nextclaude/issues"
+  },
+  "homepage": "https://github.com/youyve/nextclaude#readme",
   "engines": {
     "node": ">=18.0.0"
   }
