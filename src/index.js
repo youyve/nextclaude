@@ -2,7 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -95,6 +95,12 @@ async function serverCommand() {
   const threshold = config.switchThreshold || 0.98;
   const accountManager = new AccountManager(accounts, threshold);
 
+  // Restore last-known quota/usage and begin on the account with the most
+  // remaining quota (not config order), so a restart doesn't dump traffic onto
+  // an arbitrary account and pay a needless cache rebuild there.
+  accountManager.importState(await loadState());
+  accountManager.chooseInitialPrimary();
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `nextclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -158,7 +164,7 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: () => shutdown(),
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -212,15 +218,23 @@ async function serverCommand() {
   // background so the dashboard can show Max/Pro without delaying startup.
   fetchTiers(accountManager, tui);
 
+  // Persist quota/usage periodically so a restart can resume from real data.
+  const stateTimer = setInterval(() => { saveState(accountManager.exportState()); }, 15000);
+  stateTimer.unref();
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(stateTimer);
+    try { await saveState(accountManager.exportState()); } catch {}
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  };
+
   if (!tui) {
-    process.on('SIGINT', () => {
-      console.log('\n[NextClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[NextClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+    process.on('SIGINT', () => { console.log('\n[NextClaude] Shutting down...'); shutdown(); });
+    process.on('SIGTERM', () => { console.log('\n[NextClaude] Shutting down...'); shutdown(); });
   }
 }
 

@@ -58,3 +58,30 @@ export async function atomicConfigUpdate(updater) {
   await saveConfig(config);
   return config;
 }
+
+// ── runtime state (quota/usage) ─────────────────────────────
+// Persisted separately from the credentials config so frequent quota writes
+// never touch the config file. Lets the proxy survive restarts knowing each
+// account's remaining 5h/weekly quota (so it can pick the best one to start on).
+
+export function getStatePath() {
+  return getConfigPath().replace(/\.json$/, '') + '-state.json';
+}
+
+export async function loadState() {
+  try {
+    return JSON.parse(await readFile(getStatePath(), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+export async function saveState(state) {
+  try {
+    const path = getStatePath();
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 });
+  } catch {
+    // best-effort — losing state just means a cold quota start
+  }
+}

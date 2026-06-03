@@ -608,6 +608,43 @@ export class AccountManager {
   }
 
   /**
+   * Snapshot quota + usage (no credentials) keyed by account identity, for
+   * persisting across restarts.
+   */
+  exportState() {
+    const accounts = {};
+    for (const a of this.accounts) {
+      accounts[this._identity(a)] = { quota: { ...a.quota }, usage: { ...a.usage } };
+    }
+    return { accounts };
+  }
+
+  /**
+   * Restore a snapshot from exportState(). Matched by identity, so it survives
+   * account add/remove. Expired quota windows are dropped lazily on first use.
+   */
+  importState(state) {
+    if (!state || !state.accounts) return;
+    for (const a of this.accounts) {
+      const saved = state.accounts[this._identity(a)];
+      if (!saved) continue;
+      if (saved.quota) a.quota = { ...emptyQuota(), ...saved.quota };
+      if (saved.usage) a.usage = { ...emptyUsage(), ...saved.usage };
+      this._clearExpiredQuotas(a);
+    }
+  }
+
+  /**
+   * Choose the starting primary by remaining quota (most 5h, then most weekly)
+   * instead of config order, so after a restart traffic begins on the account
+   * with the most headroom rather than account #0.
+   */
+  chooseInitialPrimary() {
+    const best = this._selectBest();
+    this.currentIndex = best ? best.index : 0;
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {

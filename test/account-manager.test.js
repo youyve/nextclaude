@@ -229,6 +229,34 @@ test('setActiveAccount un-burns the chosen account for a session', () => {
   assert.equal(am.getActiveAccount('s1').name, 'b');
 });
 
+// ── state persistence + quota-aware startup ───────────────────
+
+test('exportState/importState round-trips quota and usage by identity', () => {
+  const am = makeManager(['a', 'b']);
+  am.accounts[0].quota.unified5h = 0.78;
+  am.accounts[0].quota.unified7d = 0.23;
+  am.accounts[0].usage.totalRequests = 9;
+  am.accounts[0].usage.totalCacheReadTokens = 1000;
+  const state = am.exportState();
+
+  const am2 = makeManager(['a', 'b']);
+  am2.importState(state);
+  assert.equal(am2.accounts[0].quota.unified5h, 0.78);
+  assert.equal(am2.accounts[0].quota.unified7d, 0.23);
+  assert.equal(am2.accounts[0].usage.totalRequests, 9);
+  assert.equal(am2.accounts[0].usage.totalCacheReadTokens, 1000);
+});
+
+test('chooseInitialPrimary starts on the most-remaining-quota account (the restart bug)', () => {
+  const am = makeManager(['youlz', 'youyve']); // config order: youlz is #0
+  am.accounts[0].quota.unified5h = 0.78; am.accounts[0].quota.unified7d = 0.23;
+  am.accounts[1].quota.unified5h = 0.60; am.accounts[1].quota.unified7d = 0.08;
+  am.chooseInitialPrimary();
+  assert.equal(am.accounts[am.currentIndex].name, 'youyve', 'primary is the freshest, not config #0');
+  // and a new conversation actually routes there
+  assert.equal(am.getActiveAccount('news', 1000).name, 'youyve');
+});
+
 // ── deriveSessionKey ──────────────────────────────────────────
 
 test('deriveSessionKey is stable across a growing conversation', () => {
