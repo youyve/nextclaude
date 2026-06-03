@@ -24,8 +24,12 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install
-npm install -g nextclaude
+# Install from GitHub
+npm install -g github:youyve/nextclaude
+
+# …or clone and install locally
+git clone https://github.com/youyve/nextclaude.git
+cd nextclaude && npm install -g .
 
 # Add your first account (opens browser for OAuth)
 nextclaude login
