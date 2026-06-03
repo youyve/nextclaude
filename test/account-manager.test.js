@@ -185,6 +185,50 @@ test('isQuotaRejection distinguishes quota exhaustion from a transient 429', () 
   assert.equal(am.isQuotaRejection(0), true);
 });
 
+// ── warm-primary routing + 5h/7d selection ordering ───────────
+
+test('a new session prefers the warm primary, not the freshest account', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.5); // current primary (currentIndex 0), warm
+  setUtil(am, 'b', 0.0); // fresher but cold
+  assert.equal(am.getActiveAccount('news', 1000).name, 'a');
+});
+
+test('_selectBest ranks by 5h, breaking ties on weekly (7d)', () => {
+  const am = makeManager(['a', 'b', 'c']);
+  const set = (n, u5, u7) => {
+    const x = am.accounts.find(a => a.name === n);
+    x.quota.unified5h = u5; x.quota.unified7d = u7;
+  };
+  set('a', 0.5, 0.8); set('b', 0.5, 0.2); set('c', 0.5, 0.5);
+  assert.equal(am._selectBest().name, 'b', 'equal 5h -> most weekly remaining (lowest 7d)');
+
+  set('a', 0.3, 0.9); set('b', 0.5, 0.1);
+  assert.equal(am._selectBest().name, 'a', '5h dominates: lower 5h wins despite higher 7d');
+});
+
+test('setActiveAccount re-pins all sessions and steers new ones', () => {
+  const am = makeManager(['a', 'b']);
+  am.getActiveAccount('s1');
+  am.getActiveAccount('s2');
+  assert.equal(am.getActiveAccount('s1').name, 'a'); // both warm on primary a
+
+  am.setActiveAccount(1); // manual switch to b
+  assert.equal(am.currentIndex, 1);
+  assert.equal(am.getActiveAccount('s1').name, 'b'); // in-flight session moved
+  assert.equal(am.getActiveAccount('s2').name, 'b');
+  assert.equal(am.getActiveAccount('s3').name, 'b'); // new session follows the new primary
+});
+
+test('setActiveAccount un-burns the chosen account for a session', () => {
+  const am = makeManager(['a', 'b']);
+  am.getActiveAccount('s1');
+  am.sessions.get('s1').burned.add(am._identity(am.accounts[1]));
+  am.setActiveAccount(1);
+  assert.equal(am.sessions.get('s1').burned.has(am._identity(am.accounts[1])), false);
+  assert.equal(am.getActiveAccount('s1').name, 'b');
+});
+
 // ── deriveSessionKey ──────────────────────────────────────────
 
 test('deriveSessionKey is stable across a growing conversation', () => {

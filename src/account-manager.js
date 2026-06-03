@@ -41,6 +41,7 @@ export class AccountManager {
       index,
       name: acct.name,
       type: acct.type,
+      tier: null,            // 'Max' | 'Pro' | 'Sub' | 'API' — filled best-effort at runtime
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
@@ -132,8 +133,46 @@ export class AccountManager {
       return pinned;
     }
 
-    // Pinned account hit the hard ceiling / is gone: switch forward.
+    if (!sess.pinned) {
+      // New conversation: prefer the account already warm with Claude Code's
+      // shared system+tools prefix (the current primary) instead of the
+      // freshest-but-cold one — every conversation shares that big prefix, so
+      // routing a new one to a different account would pay a full cold rebuild
+      // there. Spill to the best available account only if the primary can't serve.
+      const primary = this.accounts[this.currentIndex];
+      const pick = (primary && this._isAvailable(primary) && !sess.burned.has(this._identity(primary)))
+        ? primary
+        : (this._selectBest(sess.burned) || this._selectSoonestReset());
+      if (pick) {
+        sess.pinned = this._identity(pick);
+        sess.ctxPeak = contextSize;
+        this.currentIndex = pick.index;
+      }
+      return pick;
+    }
+
+    // Existing conversation whose pinned account hit the hard ceiling / is gone:
+    // switch forward (burn it, never return to its cold cache).
     return this._switchSession(sess, sessionKey, contextSize);
+  }
+
+  /**
+   * Manually route ALL traffic to a chosen account (TUI 's'). Re-pins every live
+   * session to it (un-burning it) so in-flight conversations move on their next
+   * request too, and makes it the primary new sessions follow. The user opts
+   * into the one-time cold rebuild this implies.
+   */
+  setActiveAccount(index) {
+    const acct = this.accounts[index];
+    if (!acct) return;
+    this.currentIndex = index;
+    const id = this._identity(acct);
+    for (const s of this.sessions.values()) {
+      s.pinned = id;
+      s.burned.delete(id);
+      s.ctxPeak = null;
+    }
+    console.log(`[NextClaude] Manual switch — routing all traffic to "${acct.name}"`);
   }
 
   /**
@@ -222,22 +261,51 @@ export class AccountManager {
     return u;
   }
 
+  /** Session (5h) utilization for ranking; API-key accounts use their standard short-window util. */
+  _util5h(account) {
+    const q = account.quota;
+    if (q.unified5h != null) return q.unified5h;
+    let u = 0;
+    if (q.tokensLimit != null && q.tokensRemaining != null) {
+      u = Math.max(u, 1 - q.tokensRemaining / q.tokensLimit);
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null) {
+      u = Math.max(u, 1 - q.requestsRemaining / q.requestsLimit);
+    }
+    return u;
+  }
+
+  /** Weekly (7d) utilization for ranking; 0 when not tracked (e.g. API-key accounts). */
+  _util7d(account) {
+    return account.quota.unified7d != null ? account.quota.unified7d : 0;
+  }
+
   /**
-   * Pick the available account with the most remaining quota (lowest
-   * utilization), optionally excluding a set of burned identities. Maximizing
-   * survival on the chosen account minimizes the total number of forced
-   * switches — and thus the number of cold rebuilds — over a long task.
+   * Rank two accounts for selection: most 5h quota remaining first, and on a
+   * (near-)tie prefer the account with most WEEKLY quota remaining (lower 7d
+   * utilization). Stable by index otherwise.
+   */
+  _compareForSelection(a, b) {
+    const EPS = 0.005;
+    const a5 = this._util5h(a), b5 = this._util5h(b);
+    if (Math.abs(a5 - b5) > EPS) return a5 - b5;
+    const a7 = this._util7d(a), b7 = this._util7d(b);
+    if (Math.abs(a7 - b7) > EPS) return a7 - b7;
+    return a.index - b.index;
+  }
+
+  /**
+   * Pick the available account with the most remaining quota, optionally
+   * excluding a set of burned identities. Ranks by 5h then weekly (see
+   * _compareForSelection). Maximizing survival on the chosen account minimizes
+   * the total number of forced switches — and thus cold rebuilds — over a task.
    */
   _selectBest(exclude = null) {
-    let best = null;
-    let bestUtil = Infinity;
-    for (const account of this.accounts) {
-      if (exclude && exclude.has(this._identity(account))) continue;
-      if (!this._isAvailable(account)) continue;
-      const u = this._utilization(account);
-      if (u < bestUtil) { bestUtil = u; best = account; }
-    }
-    return best;
+    const candidates = this.accounts.filter(a =>
+      !(exclude && exclude.has(this._identity(a))) && this._isAvailable(a));
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => this._compareForSelection(a, b));
+    return candidates[0];
   }
 
   /**
@@ -512,6 +580,7 @@ export class AccountManager {
       index,
       name: acctData.name,
       type: acctData.type,
+      tier: null,
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
@@ -549,6 +618,7 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        tier: a.tier,
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },
