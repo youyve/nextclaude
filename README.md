@@ -107,7 +107,7 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 
 | Key | Action |
 |-----|--------|
-| `s` | Switch active account |
+| `s` | Switch all traffic to an account (re-pins in-flight conversations too) |
 | `a` | Add account (import or API key) |
 | `r` | Remove an account |
 | `R` | Reload accounts from config |
@@ -203,12 +203,26 @@ NEXTCLAUDE_CONFIG=./my-config.json nextclaude server
 
 Anthropic's prompt cache is isolated per account, so switching accounts forces the new account to re-bill the whole cached prefix as `cache_creation` (~1.25× input price, fully counted against the new account's quota) instead of the cheap `cache_read` (~0.1×). For a task that spans *N* accounts' quota this is unavoidable **N−1** times — but no more, and each one can be made small:
 
-- **Hold the count at N−1.** Session affinity + forward-only switching mean a conversation never bounces between accounts or returns to a cold one. (This also fixes a latent bug where, with multiple concurrent conversations, a single global cursor let them flip each other's account and trigger cold rebuilds.)
-- **Shrink each rebuild.** When the pinned account crosses `switchThreshold` the switch is *armed* but deferred; the proxy watches request size and performs the switch right after the client's own auto-compaction (a sharp size drop), so the cold rebuild copies the small post-compaction prefix. A hard ceiling (utilization ≥ 0.995 or a `rejected` status) forces the switch regardless, so deferral is never worse than switching eagerly and never causes a visible rejection.
-- The proxy never rewrites request bodies, never pre-warms standby accounts, and never injects long cache TTLs — each of those either corrupts the conversation or just moves the token cost around rather than removing it.
+- **Use one account until it's actually exhausted.** All Claude Code conversations (and sub-agents) share one big `system`+`tools` prefix. New conversations are pinned to the account already warm with that prefix — not the one with the most spare quota — so they reuse its cache instead of cold-rebuilding it elsewhere. Only when an account truly hits its limit does everyone migrate forward together; it is then "burned" and never returned to (its cache died at the 5-min TTL). This holds the rebuild count at N−1 and fixes a latent bug where a single global cursor let concurrent conversations flip each other's account.
+- **When a switch is forced, keep the most quota.** The next account is chosen by most **5h** quota remaining, breaking ties by most **weekly** (7d) quota remaining.
+- **Shrink each rebuild.** Crossing `switchThreshold` only *arms* the switch; it's deferred and the proxy times it to land right after the client's own auto-compaction (a sharp request-size drop), so the cold rebuild copies the small post-compaction prefix. A hard ceiling (utilization ≥ 0.995 or a `rejected` status / quota-429) forces it regardless, so deferral is never worse than switching eagerly and never causes a visible rejection.
+- **Manual override.** Press `s` in the TUI to move *all* traffic to a chosen account immediately (handy when one account is burst-limited). In-flight conversations move on their next request.
+- The proxy never rewrites request bodies, never pre-warms standby accounts, and never injects long cache TTLs — each either corrupts the conversation or just moves the token cost around rather than removing it.
 
-`nextclaude status` reports per-account `cache_creation` / `cache_read` totals and a cold-rebuild count so you can see the effect.
+## Status fields
+
+The TUI dashboard and `nextclaude status` expose, per account:
+
+| Field | Meaning |
+|-------|---------|
+| `Ses` | Session (5h) quota utilization, with the time until it resets. Your main "how much of this 5-hour window is left" gauge. |
+| `Wk` | Weekly (7d) quota utilization + reset countdown. |
+| `Tok` / `Req` | Shown instead of `Ses`/`Wk` for API-key accounts (standard token / request limits). |
+| `req` | Total requests served by that account. |
+| `rb` | Cold rebuilds observed on it (a large `cache_creation` with little `cache_read`) — ideally ≈ the number of times traffic moved onto it. |
+| `Sessions` | Conversations currently pinned (affinity map size). |
+| `Cache … read / … rebuilt · warm %` | Aggregate `cache_read` vs `cache_creation` tokens; `warm %` is the share served from cache. Higher is cheaper — this is the headline number for whether switching is staying efficient. |
 
 ## License
 
-MIT
+[MIT](LICENSE). NextClaude is derived from the MIT-licensed [teamclaude](https://github.com/KarpelesLab/teamclaude).

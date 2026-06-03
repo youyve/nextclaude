@@ -1,6 +1,6 @@
 {
   "name": "nextclaude",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Multi-account Claude Code proxy with quota-based rotation and prompt-cache-aware account switching",
   "type": "module",
   "main": "src/index.js",
