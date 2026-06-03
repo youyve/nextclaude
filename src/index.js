@@ -7,6 +7,12 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
+import { readFileSync } from 'node:fs';
+
+const VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; }
+  catch { return ''; }
+})();
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -128,7 +134,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config,
+      accountManager, config, version: VERSION,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
@@ -171,7 +177,7 @@ async function serverCommand() {
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
-      console.log('  NextClaude Proxy');
+      console.log('  NextClaude Proxy' + (VERSION ? `  v${VERSION}` : ''));
       console.log(sep);
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
@@ -189,6 +195,10 @@ async function serverCommand() {
     }
   });
 
+  // Best-effort: resolve each OAuth account's subscription tier in the
+  // background so the dashboard can show Max/Pro without delaying startup.
+  fetchTiers(accountManager, tui);
+
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[NextClaude] Shutting down...');
@@ -198,6 +208,17 @@ async function serverCommand() {
       console.log('\n[NextClaude] Shutting down...');
       server.close(() => process.exit(0));
     });
+  }
+}
+
+function fetchTiers(accountManager, tui) {
+  for (const acct of accountManager.accounts) {
+    if (acct.type !== 'oauth' || !acct.credential) continue;
+    fetchProfile(acct.credential).then(p => {
+      if (!p || p.error) return;
+      acct.tier = p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'Sub';
+      tui?.render?.();
+    }).catch(() => {});
   }
 }
 

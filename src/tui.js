@@ -65,6 +65,15 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+/** Compact human number: 1234 -> 1.2k, 1_500_000 -> 1.5M. */
+function fmtNum(n) {
+  if (n == null) return '0';
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+  if (abs >= 1e3) return (n / 1e3).toFixed(abs >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'k';
+  return String(n);
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
@@ -114,9 +123,10 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, version }) {
     this.am = accountManager;
     this.config = config;
+    this.version = version || '';
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
@@ -242,8 +252,8 @@ export class TUI {
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
-        this.am.currentIndex = this.selIdx;
-        this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+        this.am.setActiveAccount(this.selIdx);
+        this._addLog(`Switched all traffic to "${this.am.accounts[this.selIdx].name}"`);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -381,13 +391,27 @@ export class TUI {
       return;
     }
 
+    let buf = `${ESC}H` + this._buildFrame(W, H);
+    // Show cursor only in input mode
+    buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
+    process.stdout.write(buf);
+  }
+
+  /**
+   * Build the full terminal frame as a string (pure — no stdout/isTTY access,
+   * so it can be unit-tested). Returns H rows joined by CRLF, each fit to W.
+   */
+  _buildFrame(W, H) {
     const lines = [];
 
-    // ── Header
-    const left = bold(' NextClaude');
+    // ── Header: name + version ............ port + live dot
+    const left = `${bold(' NextClaude')} ${dim(this.version ? 'v' + this.version : '')}`;
     const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    const right = `${gray('Port')} ${port} ${green('●')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
+
+    // ── Global summary: sessions · reqs · cache read/rebuilt · warm %
+    lines.push(this._summaryLine());
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
     // ── Accounts
@@ -395,14 +419,15 @@ export class TUI {
       lines.push('');
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
-      lines.push('');
-      const showBoth = W >= 70;
+      const showBoth = W >= 78;
+      const showStats = W >= 104;
+      const reserved = showStats ? 78 : (showBoth ? 56 : 45);
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
+        ? Math.max(5, Math.min(18, Math.floor((W - reserved) / 2)))
+        : Math.max(5, Math.min(18, W - reserved));
 
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth));
+        lines.push(this._renderAcct(i, bw, showBoth, showStats));
       }
     }
 
@@ -418,7 +443,7 @@ export class TUI {
     for (const [, r] of this.active) {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
-      const a = r.account ? ` → ${r.account}` : '';
+      const a = r.account ? ` → ${cyan(r.account)}` : '';
       lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
     }
 
@@ -436,34 +461,50 @@ export class TUI {
     lines.push(' ' + dim('─'.repeat(W - 2)));
     lines.push(this._renderFooter());
 
-    // Write buffer
-    let buf = `${ESC}H`;
+    let out = '';
     for (let i = 0; i < H; i++) {
-      buf += fitLine(lines[i] || '', W);
-      if (i < H - 1) buf += '\r\n';
+      out += fitLine(lines[i] || '', W);
+      if (i < H - 1) out += '\r\n';
     }
-    // Show cursor only in input mode
-    buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
+    return out;
   }
 
-  _renderAcct(idx, bw, showBoth) {
+  /** One-line aggregate: pinned sessions, total requests, cache warm vs rebuilt. */
+  _summaryLine() {
+    let read = 0, created = 0, reqs = 0;
+    for (const a of this.am.accounts) {
+      read += a.usage.totalCacheReadTokens || 0;
+      created += a.usage.totalCacheCreationTokens || 0;
+      reqs += a.usage.totalRequests || 0;
+    }
+    const sessions = this.am.sessions ? this.am.sessions.size : 0;
+    const warmPct = (read + created) > 0 ? Math.round((read / (read + created)) * 100) : null;
+    const warm = warmPct == null ? gray('warm —')
+      : (warmPct >= 80 ? green : warmPct >= 50 ? yellow : red)(`warm ${warmPct}%`);
+    const dot = dim(' · ');
+    return '  ' + [
+      `${gray('Sessions')} ${sessions}`,
+      `${gray('Reqs')} ${reqs}`,
+      `${gray('Cache')} ${fmtNum(read)} read / ${created > 0 ? red(fmtNum(created)) : '0'} rebuilt`,
+      warm,
+    ].join(dot);
+  }
+
+  _renderAcct(idx, bw, showBoth, showStats) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
-    // Prefix: selection marker + current marker
     const sel = isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    const rawName = a.name.slice(0, 14).padEnd(14);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Subscription tier (best-effort), falling back to the credential type
+    const tierRaw = a.tier || (a.type === 'apikey' ? 'API' : 'Sub');
+    const tier = gray(tierRaw.padEnd(4));
 
-    // Status
     let status;
     switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
@@ -477,26 +518,24 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
-
     if (q.unified5h != null || q.unified7d != null) {
-      r1 = q.unified5h;
-      r2 = q.unified7d;
-      t1 = q.unified5hReset;
-      t2 = q.unified7dReset;
+      r1 = q.unified5h; r2 = q.unified7d;
+      t1 = q.unified5hReset; t2 = q.unified7dReset;
     } else {
-      l1 = 'Tok';
-      l2 = 'Req';
-      r1 = (q.tokensLimit != null && q.tokensRemaining != null)
-        ? 1 - q.tokensRemaining / q.tokensLimit : null;
-      r2 = (q.requestsLimit != null && q.requestsRemaining != null)
-        ? 1 - q.requestsRemaining / q.requestsLimit : null;
+      l1 = 'Tok'; l2 = 'Req';
+      r1 = (q.tokensLimit != null && q.tokensRemaining != null) ? 1 - q.tokensRemaining / q.tokensLimit : null;
+      r2 = (q.requestsLimit != null && q.requestsRemaining != null) ? 1 - q.requestsRemaining / q.requestsLimit : null;
       t1 = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
-    if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+    // Bar shows % overlaid; reset countdown shown as a dim suffix beside it.
+    const reset = ts => { const r = formatReset(ts); return r ? ' ' + dim(rpad(r, 5)) : '      '; };
+    let line = ` ${sel}${cur} ${name} ${tier} ${status} ${l1} ${bar(r1, bw)}${reset(t1)}`;
+    if (showBoth) line += `  ${l2} ${bar(r2, bw)}${reset(t2)}`;
+    if (showStats) {
+      const rb = a.usage.totalSwitchRebuilds || 0;
+      line += `  ${dim('req ' + fmtNum(a.usage.totalRequests || 0))} ${rb > 0 ? red('rb ' + rb) : dim('rb 0')}`;
     }
     return line;
   }
