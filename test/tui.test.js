@@ -13,8 +13,11 @@ function makeTui() {
   const a = am.accounts[0];
   a.tier = 'Max';
   a.quota.unified5h = 0.45; a.quota.unified7d = 0.18;
-  a.quota.unified5hReset = 1; // formatReset returns '' for past ts; fine for tests
+  a.quota.unified5hReset = Date.now() + 2 * 3600e3;
+  a.quota.unified7dReset = Date.now() + 5 * 86400e3;
   a.usage.totalRequests = 84;
+  a.usage.totalInputTokens = 420_000;
+  a.usage.totalOutputTokens = 30_000;
   a.usage.totalCacheReadTokens = 1_200_000;
   a.usage.totalCacheCreationTokens = 84_000;
   a.usage.totalSwitchRebuilds = 1;
@@ -26,21 +29,22 @@ function makeTui() {
   return { am, tui };
 }
 
-test('_buildFrame renders the dashboard with version, summary, accounts and stats', () => {
+test('_buildFrame renders the card dashboard with version, summary, accounts and stats', () => {
   const { tui } = makeTui();
   const plain = stripAnsi(tui._buildFrame(120, 30));
-  assert.match(plain, /NextClaude/);
-  assert.match(plain, /v1\.1\.0/);
+  assert.match(plain, /NextClaude v1\.1\.0/);
   assert.match(plain, /Sessions 1/);
-  assert.match(plain, /Cache 1\.2M read \/ 84k rebuilt/);
-  assert.match(plain, /warm 93%/);          // 1.2M / (1.2M+84k)
+  assert.match(plain, /Warm 93%/);          // 1.2M / (1.2M+84k)
+  assert.match(plain, /up \d/);             // uptime
+  assert.match(plain, /Accounts/);
   assert.match(plain, /youlz@gmail/);
   assert.match(plain, /youyve@foxmail/);
   assert.match(plain, /Max/);
-  assert.match(plain, /Ses/);
-  assert.match(plain, /Wk/);
-  assert.match(plain, /req 84/);            // showStats at W=120
-  assert.match(plain, /rb 1/);
+  assert.match(plain, /5h/);
+  assert.match(plain, /7d/);
+  assert.match(plain, /84 req/);
+  assert.match(plain, /1 rebuild/);
+  assert.match(plain, /Activity/);
 });
 
 test('_buildFrame is exactly W x H and never overflows width', () => {

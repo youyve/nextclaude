@@ -21,11 +21,6 @@ const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
 
-function rpad(s, w) {
-  const gap = w - vw(s);
-  return gap > 0 ? s + ' '.repeat(gap) : s;
-}
-
 /** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
 function truncate(s, w) {
   let visible = 0;
@@ -74,46 +69,60 @@ function fmtNum(n) {
   return String(n);
 }
 
-/**
- * Render a progress bar using background colors with text overlaid.
- * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
- */
-function bar(ratio, w = 10, resetTs) {
-  const rst = formatReset(resetTs);
+function fmtUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h${m % 60}m` : `${Math.floor(h / 24)}d${h % 24}h`;
+}
 
-  if (ratio == null || isNaN(ratio)) {
-    // No data — dim background, show label or dash
-    const label = rst || '-';
-    const text = label.slice(0, w);
-    const pad = w - text.length;
-    const lp = Math.floor(pad / 2);
-    const rp = pad - lp;
-    return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
-  }
+// ── rounded-box drawing (ANSI-width aware; borders dim, title bold) ──
+const hline = n => '─'.repeat(Math.max(0, n));
 
+function boxTop(W, title, right = '') {
+  const fill = Math.max(0, W - (4 + vw(title)) - (right ? 4 + vw(right) : 2));
+  const tail = right ? ` ${right}${dim(' ─╮')}` : dim('─╮');
+  return dim('╭─ ') + bold(title) + ' ' + dim(hline(fill)) + tail;
+}
+function boxSep(W, title) {
+  const fill = Math.max(0, W - (4 + vw(title)) - 1);
+  return dim('├─ ') + bold(title) + ' ' + dim(hline(fill) + '┤');
+}
+function boxRow(W, content = '') {
+  return dim('│') + fitLine(' ' + content, W - 2) + dim('│');
+}
+function boxBottom(W, footer = '') {
+  if (!footer) return dim('╰' + hline(W - 2) + '╯');
+  const fill = Math.max(0, W - (4 + vw(footer)) - 1);
+  return dim('╰─ ') + footer + ' ' + dim(hline(fill) + '╯');
+}
+
+/** Solid progress bar (no overlaid text), colored by load. */
+function barBlocks(ratio, w) {
+  if (ratio == null || isNaN(ratio)) return gray('░'.repeat(w));
   ratio = Math.max(0, Math.min(1, ratio));
   const f = Math.round(ratio * w);
-  // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
-  const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
+  const color = ratio < 0.7 ? green : ratio < 0.9 ? yellow : red;
+  return color('█'.repeat(f)) + gray('░'.repeat(w - f));
+}
 
-  // Build the label to overlay: show reset time if available, else percentage
-  const pct = (ratio * 100).toFixed(0) + '%';
-  const label = rst || pct;
-  const text = label.slice(0, w);
-  const pad = w - text.length;
-  const lp = Math.floor(pad / 2);
-  const rp = pad - lp;
-  const chars = (' '.repeat(lp) + text + ' '.repeat(rp));
+function colorStatus(status, isCur) {
+  switch (status) {
+    case 'active':    return isCur ? green('active') : 'active';
+    case 'throttled': return yellow('throttled');
+    case 'exhausted': return red('exhausted');
+    case 'error':     return red('error');
+    default:          return status || 'ready';
+  }
+}
 
-  // Split chars into filled (colored bg) and empty (gray bg) portions
-  const filled = chars.slice(0, f);
-  const empty = chars.slice(f);
-
-  let out = '';
-  if (filled) out += `${ESC}${bg};97m${filled}`;
-  if (empty) out += `${ESC}100;37m${empty}`;
-  out += RESET;
-  return out;
+/** Tint a completed-activity line by outcome. */
+function colorLogMsg(msg) {
+  if (/\b429\b/.test(msg)) return yellow(msg);
+  if (/error|502|exhausted|fail/i.test(msg)) return red(msg);
+  return msg;
 }
 
 function timestamp() {
@@ -127,6 +136,7 @@ export class TUI {
     this.am = accountManager;
     this.config = config;
     this.version = version || '';
+    this.startedAt = Date.now();
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
@@ -399,145 +409,132 @@ export class TUI {
 
   /**
    * Build the full terminal frame as a string (pure — no stdout/isTTY access,
-   * so it can be unit-tested). Returns H rows joined by CRLF, each fit to W.
+   * so it can be unit-tested). Returns exactly H rows joined by CRLF, each W wide.
    */
   _buildFrame(W, H) {
-    const lines = [];
-
-    // ── Header: name + version ............ port + live dot
-    const left = `${bold(' NextClaude')} ${dim(this.version ? 'v' + this.version : '')}`;
     const port = this.config.proxy?.port || 3456;
-    const right = `${gray('Port')} ${port} ${green('●')} `;
-    lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
+    const ver = this.version ? `NextClaude v${this.version}` : 'NextClaude';
 
-    // ── Global summary: sessions · reqs · cache read/rebuilt · warm %
-    lines.push(this._summaryLine());
-    lines.push(' ' + dim('─'.repeat(W - 2)));
+    const top = [
+      boxTop(W, ver, `${green('●')} :${port}`),
+      boxRow(W, this._summaryLine()),
+      boxSep(W, 'Accounts'),
+    ];
 
-    // ── Accounts
+    // Account cards (each is several content rows)
+    let cardRows;
     if (this.am.accounts.length === 0) {
-      lines.push('');
-      lines.push(yellow('  No accounts configured. Press [a] to add one.'));
+      cardRows = [boxRow(W, yellow('No accounts configured. Press [a] to add one.'))];
     } else {
-      const showBoth = W >= 78;
-      const showStats = W >= 104;
-      const reserved = showStats ? 78 : (showBoth ? 56 : 45);
-      const bw = showBoth
-        ? Math.max(5, Math.min(18, Math.floor((W - reserved) / 2)))
-        : Math.max(5, Math.min(18, W - reserved));
-
+      cardRows = [];
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, showStats));
+        for (const c of this._renderCard(i, W)) cardRows.push(boxRow(W, c));
       }
     }
 
-    // ── Activity header
-    lines.push('');
     const ac = this.active.size;
-    const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
-    const aHdr = ` Activity${acTag} `;
-    lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
+    const actSep = boxSep(W, `Activity${ac ? '  ' + cyan(ac + ' active') : ''}`);
+    const bottom = boxBottom(W, this._renderFooter());
 
-    // Active requests
-    const now = Date.now();
-    for (const [, r] of this.active) {
-      const el = ((now - r.started) / 1000).toFixed(1);
-      const sp = cyan(SPINNER[this.frame]);
-      const a = r.account ? ` → ${cyan(r.account)}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
-    }
+    // Split the remaining height between cards and the activity log.
+    const room = Math.max(0, H - top.length - 2); // minus actSep + bottom
+    const shownCards = cardRows.slice(0, Math.max(1, room - 1));
+    const actRoom = Math.max(0, room - shownCards.length);
+    const actRows = this._activityRows().slice(0, actRoom).map(c => boxRow(W, c));
+    while (actRows.length < actRoom) actRows.push(boxRow(W, ''));
 
-    // Completed log
-    const footerH = 2;
-    const space = Math.max(0, H - lines.length - footerH);
-    for (let i = 0; i < space && i < this.log.length; i++) {
-      lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
-    }
-
-    // Pad to fill
-    while (lines.length < H - footerH) lines.push('');
-
-    // ── Footer
-    lines.push(' ' + dim('─'.repeat(W - 2)));
-    lines.push(this._renderFooter());
-
+    const lines = [...top, ...shownCards, actSep, ...actRows, bottom];
     let out = '';
     for (let i = 0; i < H; i++) {
-      out += fitLine(lines[i] || '', W);
+      out += fitLine(lines[i] || boxRow(W, ''), W);
       if (i < H - 1) out += '\r\n';
     }
     return out;
   }
 
-  /** One-line aggregate: pinned sessions, total requests, cache warm vs rebuilt. */
+  /** Header summary: sessions · reqs · warm% · tokens · uptime. */
   _summaryLine() {
-    let read = 0, created = 0, reqs = 0;
+    let read = 0, created = 0, reqs = 0, tin = 0, tout = 0;
     for (const a of this.am.accounts) {
       read += a.usage.totalCacheReadTokens || 0;
       created += a.usage.totalCacheCreationTokens || 0;
       reqs += a.usage.totalRequests || 0;
+      tin += a.usage.totalInputTokens || 0;
+      tout += a.usage.totalOutputTokens || 0;
     }
     const sessions = this.am.sessions ? this.am.sessions.size : 0;
     const warmPct = (read + created) > 0 ? Math.round((read / (read + created)) * 100) : null;
-    const warm = warmPct == null ? gray('warm —')
-      : (warmPct >= 80 ? green : warmPct >= 50 ? yellow : red)(`warm ${warmPct}%`);
+    const warm = warmPct == null ? gray('Warm —')
+      : (warmPct >= 80 ? green : warmPct >= 50 ? yellow : red)(`Warm ${warmPct}%`);
     const dot = dim(' · ');
-    return '  ' + [
+    return [
       `${gray('Sessions')} ${sessions}`,
       `${gray('Reqs')} ${reqs}`,
-      `${gray('Cache')} ${fmtNum(read)} read / ${created > 0 ? red(fmtNum(created)) : '0'} rebuilt`,
       warm,
+      `${dim('↑' + fmtNum(tin))} ${dim('↓' + fmtNum(tout))}`,
+      `${gray('up')} ${fmtUptime(Date.now() - this.startedAt)}`,
     ].join(dot);
   }
 
-  _renderAcct(idx, bw, showBoth, showStats) {
+  /** Render one account as an array of content lines (a "card"). */
+  _renderCard(idx, W) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
+    const marker = isCur ? green('▶') : (isSel ? cyan('▷') : ' ');
 
-    const sel = isSel ? cyan('>') : ' ';
-    const cur = isCur ? green('►') : ' ';
+    const nm = a.name.length > 30 ? a.name.slice(0, 29) + '…' : a.name;
+    const name = isSel ? bold(nm) : nm;
+    const tier = gray(a.tier || (a.type === 'apikey' ? 'API' : 'Sub'));
+    const status = colorStatus(a.status, isCur);
+    const bw = Math.max(8, Math.min(28, W - 34));
 
-    const rawName = a.name.slice(0, 14).padEnd(14);
-    const name = isSel ? bold(rawName) : rawName;
-
-    // Subscription tier (best-effort), falling back to the credential type
-    const tierRaw = a.tier || (a.type === 'apikey' ? 'API' : 'Sub');
-    const tier = gray(tierRaw.padEnd(4));
-
-    let status;
-    switch (a.status) {
-      case 'active':    status = isCur ? green('active') : 'active'; break;
-      case 'throttled': status = yellow('throttled'); break;
-      case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
-      default:          status = a.status || 'ready';
-    }
-    status = rpad(status, 10);
-
-    // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r1, r2, l1 = '5h', l2 = '7d', t1, t2;
     if (q.unified5h != null || q.unified7d != null) {
-      r1 = q.unified5h; r2 = q.unified7d;
-      t1 = q.unified5hReset; t2 = q.unified7dReset;
+      r1 = q.unified5h; r2 = q.unified7d; t1 = q.unified5hReset; t2 = q.unified7dReset;
     } else {
       l1 = 'Tok'; l2 = 'Req';
       r1 = (q.tokensLimit != null && q.tokensRemaining != null) ? 1 - q.tokensRemaining / q.tokensLimit : null;
       r2 = (q.requestsLimit != null && q.requestsRemaining != null) ? 1 - q.requestsRemaining / q.requestsLimit : null;
-      t1 = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
-      t2 = t1;
+      t1 = q.resetsAt ? new Date(q.resetsAt).getTime() : null; t2 = t1;
     }
+    const pct = r => (r == null ? '  -' : `${Math.round(r * 100)}%`).padStart(4);
+    const rst = ts => { const r = formatReset(ts); return r ? `${dim('⟳')} ${dim(r)}` : ''; };
+    const quotaRow = (lab, r, ts) => `${gray(lab)} ${barBlocks(r, bw)} ${pct(r)}  ${rst(ts)}`;
 
-    // Bar shows % overlaid; reset countdown shown as a dim suffix beside it.
-    const reset = ts => { const r = formatReset(ts); return r ? ' ' + dim(rpad(r, 5)) : '      '; };
-    let line = ` ${sel}${cur} ${name} ${tier} ${status} ${l1} ${bar(r1, bw)}${reset(t1)}`;
-    if (showBoth) line += `  ${l2} ${bar(r2, bw)}${reset(t2)}`;
-    if (showStats) {
-      const rb = a.usage.totalSwitchRebuilds || 0;
-      line += `  ${dim('req ' + fmtNum(a.usage.totalRequests || 0))} ${rb > 0 ? red('rb ' + rb) : dim('rb 0')}`;
+    const u = a.usage;
+    const rb = u.totalSwitchRebuilds || 0;
+    const stats = [
+      dim(`${fmtNum(u.totalRequests || 0)} req`),
+      rb > 0 ? red(`${rb} rebuild`) : dim('0 rebuild'),
+      dim(`↑${fmtNum(u.totalInputTokens || 0)} ↓${fmtNum(u.totalOutputTokens || 0)}`),
+    ].join(dim(' · '));
+
+    const card = [
+      `${marker} ${name}   ${tier} ${dim('·')} ${status}`,
+      `  ${quotaRow(l1, r1, t1)}`,
+      `  ${quotaRow(l2, r2, t2)}`,
+      `  ${stats}`,
+    ];
+    if (idx < this.am.accounts.length - 1) card.push('');
+    return card;
+  }
+
+  /** Activity rows (in-flight first, then completed log), as content strings. */
+  _activityRows() {
+    const rows = [];
+    const now = Date.now();
+    for (const [, r] of this.active) {
+      const el = ((now - r.started) / 1000).toFixed(1);
+      const sp = cyan(SPINNER[this.frame]);
+      const acct = r.account ? ` ${dim('→')} ${cyan(r.account)}` : '';
+      rows.push(`${sp} ${gray(r.t)} ${r.method} ${r.path}${acct} ${dim(`${el}s…`)}`);
     }
-    return line;
+    for (const e of this.log) {
+      rows.push(`${gray(e.t)}  ${colorLogMsg(e.msg)}`);
+    }
+    return rows;
   }
 
   _renderFooter() {
