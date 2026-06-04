@@ -1,245 +1,68 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/nextclaude_logo.png" alt="NextClaude" width="150">
+  <img src="https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/nextclaude_logo.png" alt="NextClaude" width="140">
 </p>
 
 <h1 align="center">NextClaude</h1>
 
-<p align="center">Multi-account proxy for <a href="https://claude.ai/claude-code">Claude Code</a> — automatically rotates accounts when one runs out of quota, while minimizing the prompt-cache rebuilds that switching costs.</p>
+<p align="center">
+  <b>Run <a href="https://claude.ai/claude-code">Claude Code</a> across multiple Claude accounts.</b><br>
+  A transparent proxy that auto-switches accounts when one runs out of quota —<br>
+  while minimizing the prompt-cache rebuilds that switching would otherwise cost.
+</p>
 
-Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max/Pro (or API key) accounts and automatically switching when one approaches its session (5h) or weekly quota limit.
+<p align="center">
+  <a href="https://www.npmjs.com/package/nextclaude"><img src="https://img.shields.io/npm/v/nextclaude?color=cb3837&logo=npm" alt="npm version"></a>
+  <img src="https://img.shields.io/node/v/nextclaude" alt="node version">
+  <a href="LICENSE"><img src="https://img.shields.io/npm/l/nextclaude" alt="license"></a>
+  <img src="https://img.shields.io/badge/dependencies-0-brightgreen" alt="zero dependencies">
+</p>
 
 ![NextClaude dashboard](https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/dashboard.png)
 
-## Features
+## Why
 
-- **Token-aware account rotation** — switches accounts when session (5h) or weekly (7d) quota runs out, while minimizing the prompt-cache rebuilds that switching otherwise costs (see [Minimizing switch cost](#minimizing-switch-cost))
-- **Session affinity** — pins each conversation to one account and never switches it back to a cache-cold account, so its prompt cache keeps hitting `cache_read` instead of being re-billed as `cache_creation`
-- **Compaction-aware switching** — defers an unavoidable switch and lands it right after the client auto-compacts, so the cold rebuild copies a small post-compaction prefix instead of the full context
-- **Auto-retry on 429** — distinguishes a transient burst limit (waits `retry-after`, retries the same account) from quota exhaustion (switches accounts)
-- **Live dashboard** — a real-time TUI (and headless `nextclaude status`) showing per-account 5h/weekly quota with reset countdowns, and a per-request **prompt-cache hit/miss + token breakdown** so you can see exactly what each request costs (see [Reading the dashboard](#reading-the-dashboard))
-- **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
-- **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
-- **Request logging** — optional full request/response logging for debugging
-- **Zero dependencies** — uses only Node.js built-in modules
+A single Claude Max/Pro account hits its 5-hour or weekly limit mid-task. NextClaude pools several accounts behind one local endpoint and hands off seamlessly. But naïve switching is expensive: Anthropic's prompt cache is **per-account**, so every switch re-bills your whole context as fresh tokens. NextClaude is built to make those switches **rare and cheap** — see [How it saves tokens](#how-it-saves-tokens).
 
-## Quick Start
+## Quick start
 
 Requires Node.js 18+.
 
 ```bash
-# Install from npm
-npm install -g nextclaude
+npm install -g nextclaude        # or: npm i -g github:youyve/nextclaude
 
-# …or from GitHub
-npm install -g github:youyve/nextclaude
-
-# …or clone and install locally
-git clone https://github.com/youyve/nextclaude.git
-cd nextclaude && npm install -g .
-
-# Add your first account (opens browser for OAuth)
-nextclaude login
-
-# Add a second account
-nextclaude login
-
-# Start the proxy
-nextclaude server
-
-# In another terminal, run Claude Code through the proxy
-nextclaude run
+nextclaude login                 # add an account (opens browser) — repeat for more
+nextclaude server                # start the proxy + live dashboard
+nextclaude run                   # in another terminal: launch Claude Code through it
 ```
 
-You can also import existing Claude Code credentials instead of logging in:
+Already signed into Claude Code? Import its credentials instead: `nextclaude import`.
 
-```bash
-claude /login           # Log into an account in Claude Code
-nextclaude import       # Import its credentials
-```
+## How it saves tokens
 
-## Adding Accounts
+Switching is unavoidable once an account is exhausted, but the cache cost is not. For a task spanning *N* accounts' quota, NextClaude holds the cost to the **N−1 floor** and shrinks each rebuild:
 
-### OAuth Login (recommended)
+- **Stay on one account until it's truly empty.** All your conversations share one big `system`+`tools` prefix; new ones pin to the account that's already warm — not the freshest. Everyone migrates forward together only when an account is actually exhausted, and never drifts back to a cache-cold one.
+- **Switch at the cheap moment.** Crossing the threshold only *arms* a switch; the proxy waits and lands it right after Claude Code auto-compacts, so the rebuild copies a small prefix instead of the full context. A hard ceiling forces it if needed — so it's never worse than switching early.
+- **Keep the most quota.** When a switch is forced, it picks the account with the most **5h** remaining, breaking ties by most **weekly** remaining.
+- **You stay in control.** Press `s` to pin all traffic to one account instantly (e.g. when one is overloaded); press it again to return to automatic.
 
-The easiest way to add accounts — opens your browser for authentication:
-
-```bash
-nextclaude login
-```
-
-Uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
-
-You can add accounts while the server is running — press **R** in the TUI to reload.
-
-### Import from Claude Code
-
-If you already have Claude Code set up, you can import its credentials directly:
-
-```bash
-claude /login           # Log into an account in Claude Code
-nextclaude import       # Import its credentials
-```
-
-Re-importing the same account updates its credentials. You can also import from a custom path:
-
-```bash
-nextclaude import --from /path/to/credentials.json
-```
-
-### API Key
-
-For Anthropic API key accounts (billed via Console):
-
-```bash
-nextclaude login --api
-```
-
-## Usage
-
-### Start the proxy server
-
-```bash
-nextclaude server
-```
-
-When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars and reset countdowns
-- Real-time activity log with request tracking
-- Keyboard shortcuts (see below)
-
-Falls back to plain log output when not a TTY (e.g. running as a service).
-
-#### TUI Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `s` | Switch all traffic to an account (re-pins in-flight conversations too) |
-| `a` | Add account (import or API key) |
-| `r` | Remove an account |
-| `R` | Reload accounts from config |
-| `q` | Quit |
-
-In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
-
-### Run Claude Code through the proxy
-
-```bash
-nextclaude run
-```
-
-Or manually set the environment:
-
-```bash
-eval $(nextclaude env)
-claude
-```
-
-### Other commands
-
-```bash
-nextclaude accounts          # List accounts with subscription tier and token status
-nextclaude accounts -v       # Also show token expiry times
-nextclaude status            # Show live proxy status (requires running server)
-nextclaude remove <name>     # Remove an account
-nextclaude api <path>        # Call an API endpoint with account credentials
-nextclaude help              # Show all commands
-```
-
-### Request logging
-
-Log full request/response details to a directory (one file per request):
-
-```bash
-nextclaude server --log-to /tmp/requests
-```
-
-## Configuration
-
-Config is stored at `~/.config/nextclaude.json` (or `$XDG_CONFIG_HOME/nextclaude.json`). A random proxy API key is generated on first use.
-
-Override the config path with `NEXTCLAUDE_CONFIG`:
-
-```bash
-NEXTCLAUDE_CONFIG=./my-config.json nextclaude server
-```
-
-### Config format
-
-```json
-{
-  "proxy": {
-    "port": 3456,
-    "apiKey": "nc-auto-generated-key"
-  },
-  "upstream": "https://api.anthropic.com",
-  "switchThreshold": 0.98,
-  "accounts": [
-    {
-      "name": "user@example.com",
-      "type": "oauth",
-      "accountUuid": "...",
-      "accessToken": "sk-ant-oat01-...",
-      "refreshToken": "sk-ant-ort01-...",
-      "expiresAt": 1774384968427
-    }
-  ]
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `proxy.port` | Local port the proxy listens on |
-| `proxy.apiKey` | API key clients use to authenticate with the proxy |
-| `upstream` | Upstream API base URL |
-| `switchThreshold` | Soft quota utilization (0–1) that *arms* a switch; the proxy then waits for a cheap moment to actually switch (default 0.98) |
-
-## How It Works
-
-1. Claude Code connects to the local proxy instead of `api.anthropic.com`
-2. The proxy derives a stable session key from each request and pins that conversation to one account, forwarding with that account's credentials
-3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. When the pinned account is exhausted the proxy switches **forward only** — to the account with the most remaining quota — and never returns to it (its cache is cold), so the realized number of rebuilds stays at the minimum
-6. On 429 responses, a transient burst limit waits `retry-after` and retries the same account; a quota rejection switches accounts
-7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
-8. If all accounts are exhausted, returns 429 with the soonest reset time
-9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
-
-## Minimizing switch cost
-
-Anthropic's prompt cache is isolated per account, so switching accounts forces the new account to re-bill the whole cached prefix as `cache_creation` (~1.25× input price, fully counted against the new account's quota) instead of the cheap `cache_read` (~0.1×). For a task that spans *N* accounts' quota this is unavoidable **N−1** times — but no more, and each one can be made small:
-
-- **Use one account until it's actually exhausted.** All Claude Code conversations (and sub-agents) share one big `system`+`tools` prefix. New conversations are pinned to the account already warm with that prefix — not the one with the most spare quota — so they reuse its cache instead of cold-rebuilding it elsewhere. Only when an account truly hits its limit does everyone migrate forward together; it is then "burned" and never returned to (its cache died at the 5-min TTL). This holds the rebuild count at N−1 and fixes a latent bug where a single global cursor let concurrent conversations flip each other's account.
-- **When a switch is forced, keep the most quota.** The next account is chosen by most **5h** quota remaining, breaking ties by most **weekly** (7d) quota remaining.
-- **Shrink each rebuild.** Crossing `switchThreshold` only *arms* the switch; it's deferred and the proxy times it to land right after the client's own auto-compaction (a sharp request-size drop), so the cold rebuild copies the small post-compaction prefix. A hard ceiling (utilization ≥ 0.995 or a `rejected` status / quota-429) forces it regardless, so deferral is never worse than switching eagerly and never causes a visible rejection.
-- **Manual override.** Press `s` in the TUI to move *all* traffic to a chosen account immediately (handy when one account is burst-limited). In-flight conversations move on their next request.
-- The proxy never rewrites request bodies, never pre-warms standby accounts, and never injects long cache TTLs — each either corrupts the conversation or just moves the token cost around rather than removing it.
+It never rewrites your requests, pre-warms standby accounts, or injects long cache TTLs — tricks that corrupt the conversation or just move the cost around.
 
 ## Reading the dashboard
 
-The interactive TUI (`nextclaude server` from a TTY) and the headless `nextclaude status` expose the same data. The most important idea is the **prompt-cache split** on each request:
+`nextclaude server` (in a TTY) shows a live dashboard; `nextclaude status` prints the same data headless. Every request is split into the part that's cheap vs the part that burns quota:
 
-- **hit** = `cache_read` — tokens served from the prompt cache. These are ~free against your 5h/weekly quota (cached input doesn't count toward the limit).
-- **miss** = `input + cache_creation` — tokens processed fresh. This is what actually **burns quota**.
-- **✎ rebuilt** = `cache_creation` — a *cold rebuild*: the whole context re-written into a new account's cache after a switch. A request with a low hit % and a big ✎ is the expensive event NextClaude works to avoid.
+| Term | Meaning |
+|------|---------|
+| **hit** | `cache_read` — served from cache. ~Free: cached input doesn't count against your quota. |
+| **miss** | `input + cache_creation` — processed fresh. **This is what burns 5h / weekly quota.** |
+| **✎** | `cache_creation` — a *cold rebuild* (the whole context rewritten after a switch). A low hit % with a big ✎ is the expensive event NextClaude avoids. |
 
-Per account you'll also see:
+Per account you also get **5h** and **7d** bars with reset countdowns, cumulative `cache <hit%>`, `✎ rebuilt`, `↑in ↓out`, request count, and a `★ manual` tag when pinned. The header summarizes pinned sessions, overall cache hit %, total tokens, and uptime; the activity log shows each request's hit/miss/✎/out and hit-rate, color-coded.
 
-| Field | Meaning |
-|-------|---------|
-| `5h` / `7d` | Session (5h) and weekly (7d) quota utilization, each with a reset countdown — your "how much of this window is left" gauge. (`Tok`/`Req` instead for API-key accounts.) |
-| `cache <hit%>` | That account's cumulative cache hit rate `read / (read + created + input)`. Higher is cheaper. |
-| `✎<n> rebuilt` | Total cold-rebuild tokens written on it. |
-| `↑in ↓out` | Total uncached input / output tokens. |
-| `req` | Requests served. |
-| `★ manual` | Marks the account you manually pinned with `s` (press `s` on it again to return to automatic). |
-
-The header summary shows pinned `Sessions`, total `Reqs`, the overall `Cache <hit%>`, aggregate `hit / ✎`, `↑in ↓out`, and uptime. The activity log shows each request's `hit · miss · ✎ · ↓out · <hit%>`, color-coded (a cold rebuild glows red).
-
-```
+```text
 $ nextclaude status
-NextClaude v1.3.1 · 2 account(s) · 9 session(s) pinned
+NextClaude v1.3.x · 2 account(s) · 9 session(s) pinned
 Active: youyve@foxmail.com · switch at 98% · cache hit 90% overall · ↑44k ↓58k · 91 reqs
 
   youlzapply@gmail.com  (Pro, active)
@@ -249,12 +72,58 @@ Active: youyve@foxmail.com · switch at 98% · cache hit 90% overall · ↑44k �
     tokens: ↑42k in · ↓46k out · 84 requests
 
 > youyve@foxmail.com  (Pro, active)  ★ manual
-    5h: 5% used (resets in 5h)
-    7d: 13% used (resets in 19h)
+    5h:  5% used (resets in 5h)
     cache: 77% hit · 520k read · ✎150k rebuilt (1 cold)
     tokens: ↑2k in · ↓12k out · 7 requests
 ```
 
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `nextclaude login` | Add a Claude subscription account via browser OAuth (`--api` for an API key) |
+| `nextclaude import [--from <path>]` | Import credentials from Claude Code (re-import updates them) |
+| `nextclaude server [--log-to <dir>]` | Start the proxy + dashboard (plain logs when not a TTY) |
+| `nextclaude run [-- <args>]` | Launch Claude Code pointed at the proxy |
+| `nextclaude env` | Print the `ANTHROPIC_BASE_URL` export to use the proxy manually |
+| `nextclaude status` | Show live quota / cache stats (needs a running server) |
+| `nextclaude accounts [-v]` | List accounts with tier and token status |
+| `nextclaude remove <name>` | Remove an account |
+
+**Dashboard keys:** `s` switch/pin account · `a` add · `r` remove · `R` reload from config · `q` quit. In a menu: `j`/`k`/arrows move, `Enter` confirms, `Esc` cancels.
+
+## Configuration
+
+Stored at `~/.config/nextclaude.json` (override with `NEXTCLAUDE_CONFIG`). A random proxy key is generated on first run; quota is cached separately in `nextclaude-state.json` so a restart resumes on the account with the most quota.
+
+| Field | Description |
+|-------|-------------|
+| `proxy.port` | Local port the proxy listens on (default `3456`) |
+| `proxy.apiKey` | Key clients use to authenticate with the proxy |
+| `upstream` | Upstream API base URL |
+| `switchThreshold` | Soft utilization (0–1) that *arms* a switch; the proxy then waits for a cheap moment (default `0.98`) |
+
+<details>
+<summary>Example config</summary>
+
+```json
+{
+  "proxy": { "port": 3456, "apiKey": "nc-…" },
+  "upstream": "https://api.anthropic.com",
+  "switchThreshold": 0.98,
+  "accounts": [
+    {
+      "name": "user@example.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-…",
+      "refreshToken": "sk-ant-ort01-…",
+      "expiresAt": 1774384968427
+    }
+  ]
+}
+```
+</details>
+
 ## License
 
-[MIT](LICENSE). NextClaude is derived from the MIT-licensed [teamclaude](https://github.com/KarpelesLab/teamclaude).
+[MIT](LICENSE) · derived from the MIT-licensed [teamclaude](https://github.com/KarpelesLab/teamclaude).

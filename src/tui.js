@@ -21,6 +21,16 @@ const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
 
+/** Pad a (possibly ANSI-colored) string to w visible columns; right-align if asked. */
+const padv = (s, w, right = false) => {
+  const gap = w - vw(s);
+  if (gap <= 0) return s;
+  return right ? ' '.repeat(gap) + s : s + ' '.repeat(gap);
+};
+/** Truncate plain text to w chars with an ellipsis. */
+const trunc = (s, w) => (s && s.length > w ? s.slice(0, w - 1) + '…' : (s || ''));
+const ACCT_W = 20; // activity-log account column width
+
 /** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
 function truncate(s, w) {
   let visible = 0;
@@ -141,17 +151,25 @@ function statusColor(status) {
  */
 export function formatRequestLine({ status, acct, dur, method, path, usage }) {
   const u = usage || {};
-  const head = `${statusColor(status)} ${dim(dur + 's')} ${cyan(acct)}`;
+  // Fixed-width columns so successive rows line up cleanly.
+  const code = statusColor(padv(String(status), 3));
+  const d = dim(padv((dur ?? '?') + 's', 6, true));
+  const name = cyan(padv(trunc(acct, ACCT_W), ACCT_W));
+  const head = `${code} ${d} ${name}`;
   const totalIn = (u.cacheRead || 0) + (u.cacheCreation || 0) + (u.input || 0);
   if (totalIn <= 0) {
     return `${head}  ${dim(`${method || ''} ${path || ''}`.trim())}`;
   }
+  const num = n => padv(fmtNum(n), 5, true);
   const miss = (u.cacheCreation || 0) + (u.input || 0);
   const hitPct = Math.round((u.cacheRead || 0) / totalIn * 100);
   const hitColor = hitPct >= 80 ? green : hitPct >= 50 ? yellow : red;
-  const rebuild = (u.cacheCreation || 0) > 0 ? ` ${red('✎' + fmtNum(u.cacheCreation))}` : '';
-  const d = dim(' · ');
-  return `${head}  ${green('hit ' + fmtNum(u.cacheRead || 0))}${d}${yellow('miss ' + fmtNum(miss))}${rebuild}${d}${dim('↓' + fmtNum(u.output || 0))}${d}${hitColor(hitPct + '%')}`;
+  const hitCol = green('hit ' + num(u.cacheRead || 0));
+  const missCol = yellow('miss ' + num(miss));
+  const rebCol = (u.cacheCreation || 0) > 0 ? red('✎' + num(u.cacheCreation)) : ' '.repeat(6);
+  const outCol = dim('↓' + num(u.output || 0));
+  const pctCol = hitColor(padv(hitPct + '%', 4, true));
+  return `${head}  ${hitCol}  ${missCol}  ${rebCol}  ${outCol}  ${pctCol}`;
 }
 
 /**
@@ -629,11 +647,13 @@ export class TUI {
   _activityRows() {
     const rows = [];
     const now = Date.now();
+    // In-flight requests, laid out on the same columns as completed rows.
     for (const [, r] of this.active) {
       const el = ((now - r.started) / 1000).toFixed(1);
-      const sp = cyan(SPINNER[this.frame]);
-      const acct = r.account ? ` ${dim('→')} ${cyan(r.account)}` : '';
-      rows.push(`${sp} ${gray(r.t)} ${r.method} ${r.path}${acct} ${dim(`${el}s…`)}`);
+      const sp = cyan(padv(SPINNER[this.frame], 3));
+      const d = dim(padv(el + 's', 6, true));
+      const name = cyan(padv(trunc(r.account || '…', ACCT_W), ACCT_W));
+      rows.push(`${gray(r.t)}  ${sp} ${d} ${name}  ${dim(trunc(`${r.method || ''} ${r.path || ''}`.trim(), 40))}`);
     }
     for (const e of this.log) {
       rows.push(`${gray(e.t)}  ${colorLogMsg(e.msg)}`);

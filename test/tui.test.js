@@ -102,10 +102,10 @@ test('formatRequestLine shows the cache hit/miss split for a warm request', () =
     status: 200, acct: 'youyve', dur: '3.0', method: 'POST', path: '/v1/messages',
     usage: { input: 1500, output: 512, cacheCreation: 0, cacheRead: 138000 },
   }));
-  assert.match(line, /200 3\.0s youyve/);
-  assert.match(line, /hit 138k/);
-  assert.match(line, /miss 1\.5k/);
-  assert.match(line, /↓512/);
+  assert.match(line, /200\s+3\.0s\s+youyve/);
+  assert.match(line, /hit\s+138k/);
+  assert.match(line, /miss\s+1\.5k/);
+  assert.match(line, /↓\s*512/);
   assert.match(line, /99%/); // 138000 / (138000+1500)
 });
 
@@ -114,10 +114,17 @@ test('formatRequestLine flags a cold rebuild with ✎ and a low hit rate', () =>
     status: 200, acct: 'a', dur: '91.0', method: 'POST', path: '/v1/messages',
     usage: { input: 2000, output: 2100, cacheCreation: 150000, cacheRead: 11000 },
   }));
-  assert.match(line, /hit 11k/);
-  assert.match(line, /miss 152k/);   // 150000 + 2000
-  assert.match(line, /✎150k/);
-  assert.match(line, /7%/);          // 11000 / 163000
+  assert.match(line, /hit\s+11k/);
+  assert.match(line, /miss\s+152k/);   // 150000 + 2000
+  assert.match(line, /✎\s*150k/);
+  assert.match(line, /7%/);            // 11000 / 163000
+});
+
+test('formatRequestLine columns are fixed-width so successive rows align', () => {
+  const a = formatRequestLine({ status: 200, acct: 'youyve@foxmail.com', dur: '2.0', usage: { input: 100, output: 7, cacheCreation: 0, cacheRead: 141000 } });
+  const b = formatRequestLine({ status: 200, acct: 'youyve@foxmail.com', dur: '25.2', usage: { input: 1400, output: 1300, cacheCreation: 0, cacheRead: 821000 } });
+  const idx = s => stripAnsi(s).indexOf('hit');
+  assert.equal(idx(a), idx(b), 'the hit column starts at the same offset regardless of dur width');
 });
 
 test('formatRequestLine falls back to method+path for non-chat / no-usage requests', () => {
@@ -125,9 +132,9 @@ test('formatRequestLine falls back to method+path for non-chat / no-usage reques
     status: 429, acct: '(none)', dur: '0.0', method: 'POST', path: '/v1/messages',
     usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
   }));
-  assert.match(line, /429 0\.0s \(none\)/);
+  assert.match(line, /429\s+0\.0s\s+\(none\)/);
   assert.match(line, /POST \/v1\/messages/);
-  assert.doesNotMatch(line, /hit /);
+  assert.doesNotMatch(line, /hit\s/);
 });
 
 test('_buildFrame shows the cache summary, legend, and a per-request activity row', () => {
@@ -143,7 +150,7 @@ test('_buildFrame shows the cache summary, legend, and a per-request activity ro
   assert.match(plain, /Cache 90%/);            // 900k / (900k+100k+5k) ≈ 90%
   assert.match(plain, /served from cache/);    // legend
   assert.match(plain, /cache \d+%/);           // per-account
-  assert.match(plain, /hit 90k/);              // the activity row
+  assert.match(plain, /hit\s+90k/);            // the activity row
 });
 
 test('formatStatusText shows the cache breakdown for the headless status command', () => {
