@@ -719,8 +719,10 @@ export class AccountManager {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       activeSessions: this.sessions.size,
+      manual: this.manualPin,
       accounts: this.accounts.map(a => ({
         name: a.name,
+        identity: this._identity(a),
         type: a.type,
         tier: a.tier,
         status: a.status,

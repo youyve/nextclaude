@@ -16,7 +16,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Session affinity** — pins each conversation to one account and never switches it back to a cache-cold account, so its prompt cache keeps hitting `cache_read` instead of being re-billed as `cache_creation`
 - **Compaction-aware switching** — defers an unavoidable switch and lands it right after the client auto-compacts, so the cold rebuild copies a small post-compaction prefix instead of the full context
 - **Auto-retry on 429** — distinguishes a transient burst limit (waits `retry-after`, retries the same account) from quota exhaustion (switches accounts)
-- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
+- **Live dashboard** — a real-time TUI (and headless `nextclaude status`) showing per-account 5h/weekly quota with reset countdowns, and a per-request **prompt-cache hit/miss + token breakdown** so you can see exactly what each request costs (see [Reading the dashboard](#reading-the-dashboard))
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
@@ -216,19 +216,44 @@ Anthropic's prompt cache is isolated per account, so switching accounts forces t
 - **Manual override.** Press `s` in the TUI to move *all* traffic to a chosen account immediately (handy when one account is burst-limited). In-flight conversations move on their next request.
 - The proxy never rewrites request bodies, never pre-warms standby accounts, and never injects long cache TTLs — each either corrupts the conversation or just moves the token cost around rather than removing it.
 
-## Status fields
+## Reading the dashboard
 
-The TUI dashboard and `nextclaude status` expose, per account:
+The interactive TUI (`nextclaude server` from a TTY) and the headless `nextclaude status` expose the same data. The most important idea is the **prompt-cache split** on each request:
+
+- **hit** = `cache_read` — tokens served from the prompt cache. These are ~free against your 5h/weekly quota (cached input doesn't count toward the limit).
+- **miss** = `input + cache_creation` — tokens processed fresh. This is what actually **burns quota**.
+- **✎ rebuilt** = `cache_creation` — a *cold rebuild*: the whole context re-written into a new account's cache after a switch. A request with a low hit % and a big ✎ is the expensive event NextClaude works to avoid.
+
+Per account you'll also see:
 
 | Field | Meaning |
 |-------|---------|
-| `Ses` | Session (5h) quota utilization, with the time until it resets. Your main "how much of this 5-hour window is left" gauge. |
-| `Wk` | Weekly (7d) quota utilization + reset countdown. |
-| `Tok` / `Req` | Shown instead of `Ses`/`Wk` for API-key accounts (standard token / request limits). |
-| `req` | Total requests served by that account. |
-| `rb` | Cold rebuilds observed on it (a large `cache_creation` with little `cache_read`) — ideally ≈ the number of times traffic moved onto it. |
-| `Sessions` | Conversations currently pinned (affinity map size). |
-| `Cache … read / … rebuilt · warm %` | Aggregate `cache_read` vs `cache_creation` tokens; `warm %` is the share served from cache. Higher is cheaper — this is the headline number for whether switching is staying efficient. |
+| `5h` / `7d` | Session (5h) and weekly (7d) quota utilization, each with a reset countdown — your "how much of this window is left" gauge. (`Tok`/`Req` instead for API-key accounts.) |
+| `cache <hit%>` | That account's cumulative cache hit rate `read / (read + created + input)`. Higher is cheaper. |
+| `✎<n> rebuilt` | Total cold-rebuild tokens written on it. |
+| `↑in ↓out` | Total uncached input / output tokens. |
+| `req` | Requests served. |
+| `★ manual` | Marks the account you manually pinned with `s` (press `s` on it again to return to automatic). |
+
+The header summary shows pinned `Sessions`, total `Reqs`, the overall `Cache <hit%>`, aggregate `hit / ✎`, `↑in ↓out`, and uptime. The activity log shows each request's `hit · miss · ✎ · ↓out · <hit%>`, color-coded (a cold rebuild glows red).
+
+```
+$ nextclaude status
+NextClaude v1.3.1 · 2 account(s) · 9 session(s) pinned
+Active: youyve@foxmail.com · switch at 98% · cache hit 90% overall · ↑44k ↓58k · 91 reqs
+
+  youlzapply@gmail.com  (Pro, active)
+    5h: 43% used (resets in 4h16m)
+    7d: 30% used (resets in 5d3h)
+    cache: 93% hit · 2.2M read · ✎120k rebuilt (1 cold)
+    tokens: ↑42k in · ↓46k out · 84 requests
+
+> youyve@foxmail.com  (Pro, active)  ★ manual
+    5h: 5% used (resets in 5h)
+    7d: 13% used (resets in 19h)
+    cache: 77% hit · 520k read · ✎150k rebuilt (1 cold)
+    tokens: ↑2k in · ↓12k out · 7 requests
+```
 
 ## License
 

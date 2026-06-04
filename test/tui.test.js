@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TUI, formatRequestLine } from '../src/tui.js';
+import { TUI, formatRequestLine, formatStatusText } from '../src/tui.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -144,6 +144,28 @@ test('_buildFrame shows the cache summary, legend, and a per-request activity ro
   assert.match(plain, /served from cache/);    // legend
   assert.match(plain, /cache \d+%/);           // per-account
   assert.match(plain, /hit 90k/);              // the activity row
+});
+
+test('formatStatusText shows the cache breakdown for the headless status command', () => {
+  const data = {
+    currentAccount: 'b', switchThreshold: 0.98, activeSessions: 2, manual: 'b',
+    accounts: [
+      { name: 'a', identity: 'a', type: 'oauth', tier: 'Pro', status: 'active', rateLimitedUntil: null,
+        quota: { unified5h: 0.43, unified7d: 0.30 },
+        usage: { totalRequests: 84, totalInputTokens: 42000, totalOutputTokens: 46000, totalCacheReadTokens: 2240000, totalCacheCreationTokens: 120000, totalSwitchRebuilds: 1 } },
+      { name: 'b', identity: 'b', type: 'oauth', tier: 'Pro', status: 'active', rateLimitedUntil: null,
+        quota: { unified5h: 0.05, unified7d: 0.13 },
+        usage: { totalRequests: 7, totalInputTokens: 2000, totalOutputTokens: 12000, totalCacheReadTokens: 520000, totalCacheCreationTokens: 150000, totalSwitchRebuilds: 1 } },
+    ],
+  };
+  const out = formatStatusText(data, '1.3.1');
+  assert.match(out, /NextClaude v1\.3\.1/);
+  assert.match(out, /cache hit 90% overall/);
+  assert.match(out, /cache: 93% hit · 2\.2M read · ✎120k rebuilt \(1 cold\)/);
+  assert.match(out, /5h: 43% used/);
+  assert.match(out, /★ manual/);                 // marked on account b
+  assert.ok(out.includes('> b'), 'current account marked with >');
+  assert.doesNotMatch(out, /\x1b\[/, 'plain text, no ANSI');
 });
 
 test('_buildFrame handles the no-accounts case', () => {

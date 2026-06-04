@@ -6,7 +6,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { TUI } from './tui.js';
+import { TUI, formatStatusText } from './tui.js';
 import { readFileSync } from 'node:fs';
 
 const VERSION = (() => {
@@ -424,36 +424,7 @@ async function statusCommand() {
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
-
-    console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage`);
-    if (data.activeSessions != null) console.log(`Sessions:       ${data.activeSessions} pinned`);
-    console.log('');
-
-    for (const acct of data.accounts) {
-      const q = acct.quota;
-      const current = acct.name === data.currentAccount ? ' *' : '';
-
-      console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}`);
-
-      if (q.unified5h != null || q.unified7d != null) {
-        const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
-        const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        console.log(`    Session:  ${ses} used    Weekly: ${wk} used`);
-      } else {
-        const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
-        const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
-        console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
-      }
-
-      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
-      if (acct.usage.totalCacheCreationTokens || acct.usage.totalCacheReadTokens) {
-        console.log(`    Cache:    ${acct.usage.totalCacheCreationTokens} created (rebuilds), ${acct.usage.totalCacheReadTokens} read (warm), ${acct.usage.totalSwitchRebuilds} cold rebuild(s)`);
-      }
-      if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
-      console.log('');
-    }
+    console.log(formatStatusText(data, VERSION));
   } catch {
     console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
     console.error('Is the server running? Start with: nextclaude server');

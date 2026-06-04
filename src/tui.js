@@ -46,7 +46,7 @@ function fitLine(s, w) {
   return s;
 }
 
-function formatReset(resetTs) {
+export function formatReset(resetTs) {
   if (!resetTs) return '';
   const ms = resetTs - Date.now();
   if (ms <= 0) return '';
@@ -61,7 +61,7 @@ function formatReset(resetTs) {
 }
 
 /** Compact human number: 1234 -> 1.2k, 1_500_000 -> 1.5M. */
-function fmtNum(n) {
+export function fmtNum(n) {
   if (n == null) return '0';
   const abs = Math.abs(n);
   if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
@@ -152,6 +152,51 @@ export function formatRequestLine({ status, acct, dur, method, path, usage }) {
   const rebuild = (u.cacheCreation || 0) > 0 ? ` ${red('✎' + fmtNum(u.cacheCreation))}` : '';
   const d = dim(' · ');
   return `${head}  ${green('hit ' + fmtNum(u.cacheRead || 0))}${d}${yellow('miss ' + fmtNum(miss))}${rebuild}${d}${dim('↓' + fmtNum(u.output || 0))}${d}${hitColor(hitPct + '%')}`;
+}
+
+/**
+ * Plain-text status block for `nextclaude status` (headless / piped output).
+ * Mirrors the TUI's cache/token breakdown without ANSI color.
+ */
+export function formatStatusText(data, version) {
+  const accts = data.accounts || [];
+  let read = 0, created = 0, input = 0, out = 0, reqs = 0;
+  for (const a of accts) {
+    const u = a.usage || {};
+    read += u.totalCacheReadTokens || 0;
+    created += u.totalCacheCreationTokens || 0;
+    input += u.totalInputTokens || 0;
+    out += u.totalOutputTokens || 0;
+    reqs += u.totalRequests || 0;
+  }
+  const gd = read + created + input;
+  const gHit = gd > 0 ? Math.round(read / gd * 100) + '%' : '—';
+  const lines = [];
+  lines.push(`NextClaude${version ? ' v' + version : ''} · ${accts.length} account(s) · ${data.activeSessions ?? 0} session(s) pinned`);
+  lines.push(`Active: ${data.currentAccount || '—'} · switch at ${Math.round((data.switchThreshold || 0) * 100)}% · cache hit ${gHit} overall · ↑${fmtNum(input)} ↓${fmtNum(out)} · ${reqs} reqs`);
+  lines.push('');
+  for (const a of accts) {
+    const q = a.quota || {}, u = a.usage || {};
+    const cur = a.name === data.currentAccount ? '> ' : '  ';
+    const manual = data.manual && a.identity === data.manual ? '  ★ manual' : '';
+    lines.push(`${cur}${a.name}  (${a.tier || (a.type === 'apikey' ? 'API' : 'Sub')}, ${a.status})${manual}`);
+    if (q.unified5h != null || q.unified7d != null) {
+      const w = (r, ts) => `${r != null ? Math.round(r * 100) + '%' : '—'} used${formatReset(ts) ? ` (resets in ${formatReset(ts)})` : ''}`;
+      lines.push(`    5h: ${w(q.unified5h, q.unified5hReset)}`);
+      lines.push(`    7d: ${w(q.unified7d, q.unified7dReset)}`);
+    } else {
+      const p = (lim, rem) => (lim != null && rem != null) ? Math.round((1 - rem / lim) * 100) + '%' : '—';
+      lines.push(`    tokens: ${p(q.tokensLimit, q.tokensRemaining)} used · requests: ${p(q.requestsLimit, q.requestsRemaining)} used`);
+    }
+    const ar = u.totalCacheReadTokens || 0, ac = u.totalCacheCreationTokens || 0, ai = u.totalInputTokens || 0;
+    const ad = ar + ac + ai;
+    const aHit = ad > 0 ? Math.round(ar / ad * 100) + '%' : '—';
+    lines.push(`    cache: ${aHit} hit · ${fmtNum(ar)} read · ✎${fmtNum(ac)} rebuilt${u.totalSwitchRebuilds ? ` (${u.totalSwitchRebuilds} cold)` : ''}`);
+    lines.push(`    tokens: ↑${fmtNum(ai)} in · ↓${fmtNum(u.totalOutputTokens || 0)} out · ${u.totalRequests || 0} requests`);
+    if (a.rateLimitedUntil) lines.push(`    throttled until: ${a.rateLimitedUntil}`);
+    lines.push('');
+  }
+  return lines.join('\n').replace(/\n+$/, '');
 }
 
 function timestamp() {
