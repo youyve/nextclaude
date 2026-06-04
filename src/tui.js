@@ -125,6 +125,35 @@ function colorLogMsg(msg) {
   return msg;
 }
 
+function statusColor(status) {
+  const s = String(status);
+  if (s.startsWith('2')) return green(s);
+  if (s === '429') return yellow(s);
+  return red(s);
+}
+
+/**
+ * One completed-request activity line. For a chat request it shows the prompt-
+ * cache split: hit (served from cache, ~free against quota) vs miss (input +
+ * cache_creation, what actually burns quota), the cold-rebuild size (✎), output,
+ * and the cache hit rate. Non-chat / no-usage requests fall back to method+path.
+ * Pure (no `this`) so it can be unit-tested.
+ */
+export function formatRequestLine({ status, acct, dur, method, path, usage }) {
+  const u = usage || {};
+  const head = `${statusColor(status)} ${dim(dur + 's')} ${cyan(acct)}`;
+  const totalIn = (u.cacheRead || 0) + (u.cacheCreation || 0) + (u.input || 0);
+  if (totalIn <= 0) {
+    return `${head}  ${dim(`${method || ''} ${path || ''}`.trim())}`;
+  }
+  const miss = (u.cacheCreation || 0) + (u.input || 0);
+  const hitPct = Math.round((u.cacheRead || 0) / totalIn * 100);
+  const hitColor = hitPct >= 80 ? green : hitPct >= 50 ? yellow : red;
+  const rebuild = (u.cacheCreation || 0) > 0 ? ` ${red('✎' + fmtNum(u.cacheCreation))}` : '';
+  const d = dim(' · ');
+  return `${head}  ${green('hit ' + fmtNum(u.cacheRead || 0))}${d}${yellow('miss ' + fmtNum(miss))}${rebuild}${d}${dim('↓' + fmtNum(u.output || 0))}${d}${hitColor(hitPct + '%')}`;
+}
+
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
@@ -213,7 +242,9 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    this._addLog(formatRequestLine({
+      status: info.status, acct, dur, method: info.method, path: info.path, usage: info.usage,
+    }));
   }
 
   _addLog(msg) {
@@ -429,8 +460,9 @@ export class TUI {
     const top = [
       boxTop(W, ver, `${green('●')} :${port}`),
       boxRow(W, this._summaryLine()),
-      boxSep(W, 'Accounts'),
     ];
+    if (W >= 84) top.push(boxRow(W, this._legendLine()));
+    top.push(boxSep(W, 'Accounts'));
 
     // Account cards (each is several content rows)
     let cardRows;
@@ -474,17 +506,24 @@ export class TUI {
       tout += a.usage.totalOutputTokens || 0;
     }
     const sessions = this.am.sessions ? this.am.sessions.size : 0;
-    const warmPct = (read + created) > 0 ? Math.round((read / (read + created)) * 100) : null;
-    const warm = warmPct == null ? gray('Warm —')
-      : (warmPct >= 80 ? green : warmPct >= 50 ? yellow : red)(`Warm ${warmPct}%`);
+    const denom = read + created + tin;
+    const hitPct = denom > 0 ? Math.round((read / denom) * 100) : null; // true cache hit rate
+    const cache = hitPct == null ? gray('Cache —')
+      : (hitPct >= 80 ? green : hitPct >= 50 ? yellow : red)(`Cache ${hitPct}%`);
     const dot = dim(' · ');
     return [
       `${gray('Sessions')} ${sessions}`,
       `${gray('Reqs')} ${reqs}`,
-      warm,
+      cache,
+      `${green('hit ' + fmtNum(read))} ${dim('/')} ${created > 0 ? red('✎' + fmtNum(created)) : dim('✎0')}`,
       `${dim('↑' + fmtNum(tin))} ${dim('↓' + fmtNum(tout))}`,
       `${gray('up')} ${fmtUptime(Date.now() - this.startedAt)}`,
     ].join(dot);
+  }
+
+  /** One-line glossary so the cache columns are understandable at a glance. */
+  _legendLine() {
+    return dim('hit = served from cache (≈free) · miss/✎ = burns 5h+weekly quota');
   }
 
   /** Render one account as an array of content lines (a "card"). */
@@ -515,11 +554,18 @@ export class TUI {
     const quotaRow = (lab, r, ts) => `${gray(lab)} ${barBlocks(r, bw)} ${pct(r)}  ${rst(ts)}`;
 
     const u = a.usage;
-    const rb = u.totalSwitchRebuilds || 0;
+    const read = u.totalCacheReadTokens || 0;
+    const created = u.totalCacheCreationTokens || 0;
+    const inp = u.totalInputTokens || 0;
+    const denom = read + created + inp;
+    const hitPct = denom > 0 ? Math.round(read / denom * 100) : null;
+    const cacheTag = hitPct == null ? gray('cache —')
+      : (hitPct >= 80 ? green : hitPct >= 50 ? yellow : red)(`cache ${hitPct}%`);
     const stats = [
       dim(`${fmtNum(u.totalRequests || 0)} req`),
-      rb > 0 ? red(`${rb} rebuild`) : dim('0 rebuild'),
-      dim(`↑${fmtNum(u.totalInputTokens || 0)} ↓${fmtNum(u.totalOutputTokens || 0)}`),
+      cacheTag,
+      created > 0 ? red(`✎${fmtNum(created)} rebuilt`) : dim('✎0 rebuilt'),
+      dim(`↑${fmtNum(inp)} ↓${fmtNum(u.totalOutputTokens || 0)}`),
     ].join(dim(' · '));
 
     const isManual = this.am.manualPin && this.am.manualPin === this.am._identity(a);

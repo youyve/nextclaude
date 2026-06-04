@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TUI } from '../src/tui.js';
+import { TUI, formatRequestLine } from '../src/tui.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -34,7 +34,7 @@ test('_buildFrame renders the card dashboard with version, summary, accounts and
   const plain = stripAnsi(tui._buildFrame(120, 30));
   assert.match(plain, /NextClaude v1\.1\.0/);
   assert.match(plain, /Sessions 1/);
-  assert.match(plain, /Warm 93%/);          // 1.2M / (1.2M+84k)
+  assert.match(plain, /Cache \d+%/);        // true hit rate read/(read+created+input)
   assert.match(plain, /up \d/);             // uptime
   assert.match(plain, /Accounts/);
   assert.match(plain, /youlz@gmail/);
@@ -43,7 +43,8 @@ test('_buildFrame renders the card dashboard with version, summary, accounts and
   assert.match(plain, /5h/);
   assert.match(plain, /7d/);
   assert.match(plain, /84 req/);
-  assert.match(plain, /1 rebuild/);
+  assert.match(plain, /cache \d+%/);        // per-account cache rate
+  assert.match(plain, /rebuilt/);           // ✎<tokens> rebuilt
   assert.match(plain, /Activity/);
 });
 
@@ -94,6 +95,55 @@ test('refreshExpiredQuotas logging does not crash a console-redirected TUI', () 
     console.log = origLog;
     process.stdout.write = origWrite;
   }
+});
+
+test('formatRequestLine shows the cache hit/miss split for a warm request', () => {
+  const line = stripAnsi(formatRequestLine({
+    status: 200, acct: 'youyve', dur: '3.0', method: 'POST', path: '/v1/messages',
+    usage: { input: 1500, output: 512, cacheCreation: 0, cacheRead: 138000 },
+  }));
+  assert.match(line, /200 3\.0s youyve/);
+  assert.match(line, /hit 138k/);
+  assert.match(line, /miss 1\.5k/);
+  assert.match(line, /↓512/);
+  assert.match(line, /99%/); // 138000 / (138000+1500)
+});
+
+test('formatRequestLine flags a cold rebuild with ✎ and a low hit rate', () => {
+  const line = stripAnsi(formatRequestLine({
+    status: 200, acct: 'a', dur: '91.0', method: 'POST', path: '/v1/messages',
+    usage: { input: 2000, output: 2100, cacheCreation: 150000, cacheRead: 11000 },
+  }));
+  assert.match(line, /hit 11k/);
+  assert.match(line, /miss 152k/);   // 150000 + 2000
+  assert.match(line, /✎150k/);
+  assert.match(line, /7%/);          // 11000 / 163000
+});
+
+test('formatRequestLine falls back to method+path for non-chat / no-usage requests', () => {
+  const line = stripAnsi(formatRequestLine({
+    status: 429, acct: '(none)', dur: '0.0', method: 'POST', path: '/v1/messages',
+    usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+  }));
+  assert.match(line, /429 0\.0s \(none\)/);
+  assert.match(line, /POST \/v1\/messages/);
+  assert.doesNotMatch(line, /hit /);
+});
+
+test('_buildFrame shows the cache summary, legend, and a per-request activity row', () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'x' }], 0.98);
+  Object.assign(am.accounts[0].usage, {
+    totalRequests: 10, totalInputTokens: 5000, totalOutputTokens: 8000,
+    totalCacheReadTokens: 900000, totalCacheCreationTokens: 100000,
+  });
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, version: '1.3.0', saveConfig() {}, syncAccounts() {}, onQuit() {} });
+  tui.active.set(1, { method: 'POST', path: '/v1/messages', t: '12:00', started: Date.now() - 3000, account: 'a' });
+  tui.onRequestEnd(1, { method: 'POST', path: '/v1/messages', account: 'a', status: 200, usage: { input: 1000, output: 200, cacheCreation: 0, cacheRead: 90000 } });
+  const plain = stripAnsi(tui._buildFrame(132, 24));
+  assert.match(plain, /Cache 90%/);            // 900k / (900k+100k+5k) ≈ 90%
+  assert.match(plain, /served from cache/);    // legend
+  assert.match(plain, /cache \d+%/);           // per-account
+  assert.match(plain, /hit 90k/);              // the activity row
 });
 
 test('_buildFrame handles the no-accounts case', () => {

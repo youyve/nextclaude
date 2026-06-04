@@ -92,7 +92,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // every retry of this request routes to the same pinned account.
       const sessionKey = deriveSessionKey(body);
 
-      const ctx = { account: null, status: null };
+      const ctx = { account: null, status: null, usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 } };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sessionKey);
       } catch (err) {
@@ -108,7 +108,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       } finally {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
-          account: ctx.account, status: ctx.status,
+          account: ctx.account, status: ctx.status, usage: ctx.usage,
         });
       }
     } catch (err) {
@@ -362,14 +362,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
+      await streamResponse(upstreamRes.body, res, ctx.usage, streamLog);
+      accountManager.updateUsage(account.index, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, ctx.usage);
+      accountManager.updateUsage(account.index, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -418,7 +420,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, usage, streamLog) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -445,7 +447,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, usage);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -461,7 +463,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, usage);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -470,7 +472,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, usage) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -478,26 +480,27 @@ function parseSSEUsage(event, accountIndex, accountManager) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       const u = data.message.usage;
-      accountManager.updateUsage(
-        accountIndex, u.input_tokens, 0,
-        u.cache_creation_input_tokens || 0, u.cache_read_input_tokens || 0,
-      );
+      usage.input += u.input_tokens || 0;
+      usage.cacheCreation += u.cache_creation_input_tokens || 0;
+      usage.cacheRead += u.cache_read_input_tokens || 0;
+      if (u.output_tokens) usage.output = Math.max(usage.output, u.output_tokens);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      // output_tokens here is cumulative for the message — take the max, don't sum.
+      usage.output = Math.max(usage.output, data.usage.output_tokens || 0);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, usage) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(
-        accountIndex, json.usage.input_tokens, json.usage.output_tokens,
-        json.usage.cache_creation_input_tokens || 0, json.usage.cache_read_input_tokens || 0,
-      );
+      usage.input += json.usage.input_tokens || 0;
+      usage.output = Math.max(usage.output, json.usage.output_tokens || 0);
+      usage.cacheCreation += json.usage.cache_creation_input_tokens || 0;
+      usage.cacheRead += json.usage.cache_read_input_tokens || 0;
     }
   } catch {
     // not JSON or no usage

@@ -56,10 +56,11 @@ test('end-to-end: proxy forwards, captures cache usage, and pins a session', asy
     { name: 'a', type: 'apikey', apiKey: 'key-a' },
     { name: 'b', type: 'apikey', apiKey: 'key-b' },
   ], 0.98);
+  const ends = [];
   const proxy = createProxyServer(am, {
     upstream: `http://127.0.0.1:${upstreamPort}`,
     proxy: { apiKey: 'test' },
-  });
+  }, { onRequestEnd: (id, info) => ends.push(info) });
   const proxyPort = await listen(proxy);
   const url = `http://127.0.0.1:${proxyPort}/v1/messages`;
   const post = (extra) => fetch(url, {
@@ -72,6 +73,10 @@ test('end-to-end: proxy forwards, captures cache usage, and pins a session', asy
     const r1 = await post();
     assert.equal(r1.status, 200);
     assert.ok(r1.text.includes('message_start'), 'SSE body streamed through');
+
+    // The onRequestEnd hook carries the per-request usage breakdown.
+    assert.equal(ends.length, 1);
+    assert.deepEqual(ends[0].usage, { input: 5, output: 7, cacheCreation: 0, cacheRead: 1234 });
 
     const served = am.accounts.find(a => a.usage.totalRequests > 0);
     assert.ok(served, 'a request was attributed to an account');
