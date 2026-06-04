@@ -17,8 +17,6 @@
   <img src="https://img.shields.io/badge/dependencies-0-brightgreen" alt="zero dependencies">
 </p>
 
-![NextClaude dashboard](https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/dashboard.png)
-
 ## Why
 
 A single Claude Max/Pro account hits its 5-hour or weekly limit mid-task. NextClaude pools several accounts behind one local endpoint and hands off seamlessly. But naïve switching is expensive: Anthropic's prompt cache is **per-account**, so every switch re-bills your whole context as fresh tokens. NextClaude is built to make those switches **rare and cheap** — see [How it saves tokens](#how-it-saves-tokens).
@@ -63,15 +61,15 @@ Per account you also get **5h** and **7d** bars with reset countdowns, cumulativ
 ```text
 $ nextclaude status
 NextClaude v1.3.x · 2 account(s) · 9 session(s) pinned
-Active: youyve@foxmail.com · switch at 98% · cache hit 90% overall · ↑44k ↓58k · 91 reqs
+Active: account-b@example.com · switch at 98% · cache hit 90% overall · ↑44k ↓58k · 91 reqs
 
-  youlzapply@gmail.com  (Pro, active)
+  account-a@example.com  (Pro, active)
     5h: 43% used (resets in 4h16m)
     7d: 30% used (resets in 5d3h)
     cache: 93% hit · 2.2M read · ✎120k rebuilt (1 cold)
     tokens: ↑42k in · ↓46k out · 84 requests
 
-> youyve@foxmail.com  (Pro, active)  ★ manual
+> account-b@example.com  (Pro, active)  ★ manual
     5h:  5% used (resets in 5h)
     cache: 77% hit · 520k read · ✎150k rebuilt (1 cold)
     tokens: ↑2k in · ↓12k out · 7 requests

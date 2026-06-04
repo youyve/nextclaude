@@ -7,8 +7,8 @@ const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 function makeTui() {
   const am = new AccountManager([
-    { name: 'youlz@gmail.com', type: 'oauth', accessToken: 'x' },
-    { name: 'youyve@foxmail.com', type: 'oauth', accessToken: 'y' },
+    { name: 'a@example.com', type: 'oauth', accessToken: 'x' },
+    { name: 'b@example.com', type: 'oauth', accessToken: 'y' },
   ], 0.98);
   const a = am.accounts[0];
   a.tier = 'Max';
@@ -21,7 +21,7 @@ function makeTui() {
   a.usage.totalCacheReadTokens = 1_200_000;
   a.usage.totalCacheCreationTokens = 84_000;
   a.usage.totalSwitchRebuilds = 1;
-  am.sessions.set('k', { pinned: 'youlz@gmail.com', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
+  am.sessions.set('k', { pinned: 'a@example.com', burned: new Set(), lastSeen: Date.now(), ctxPeak: null });
   const tui = new TUI({
     accountManager: am, config: { proxy: { port: 3456 } }, version: '1.1.0',
     saveConfig() {}, syncAccounts() {}, onQuit() {},
@@ -37,8 +37,8 @@ test('_buildFrame renders the card dashboard with version, summary, accounts and
   assert.match(plain, /Cache \d+%/);        // true hit rate read/(read+created+input)
   assert.match(plain, /up \d/);             // uptime
   assert.match(plain, /Accounts/);
-  assert.match(plain, /youlz@gmail/);
-  assert.match(plain, /youyve@foxmail/);
+  assert.match(plain, /a@example/);
+  assert.match(plain, /b@example/);
   assert.match(plain, /Max/);
   assert.match(plain, /5h/);
   assert.match(plain, /7d/);
@@ -99,10 +99,10 @@ test('refreshExpiredQuotas logging does not crash a console-redirected TUI', () 
 
 test('formatRequestLine shows the cache hit/miss split for a warm request', () => {
   const line = stripAnsi(formatRequestLine({
-    status: 200, acct: 'youyve', dur: '3.0', method: 'POST', path: '/v1/messages',
+    status: 200, acct: 'b@example.com', dur: '3.0', method: 'POST', path: '/v1/messages',
     usage: { input: 1500, output: 512, cacheCreation: 0, cacheRead: 138000 },
   }));
-  assert.match(line, /200\s+3\.0s\s+youyve/);
+  assert.match(line, /200\s+3\.0s\s+b@example/);
   assert.match(line, /hit\s+138k/);
   assert.match(line, /miss\s+1\.5k/);
   assert.match(line, /↓\s*512/);
@@ -121,8 +121,8 @@ test('formatRequestLine flags a cold rebuild with ✎ and a low hit rate', () =>
 });
 
 test('formatRequestLine columns are fixed-width so successive rows align', () => {
-  const a = formatRequestLine({ status: 200, acct: 'youyve@foxmail.com', dur: '2.0', usage: { input: 100, output: 7, cacheCreation: 0, cacheRead: 141000 } });
-  const b = formatRequestLine({ status: 200, acct: 'youyve@foxmail.com', dur: '25.2', usage: { input: 1400, output: 1300, cacheCreation: 0, cacheRead: 821000 } });
+  const a = formatRequestLine({ status: 200, acct: 'b@example.com', dur: '2.0', usage: { input: 100, output: 7, cacheCreation: 0, cacheRead: 141000 } });
+  const b = formatRequestLine({ status: 200, acct: 'b@example.com', dur: '25.2', usage: { input: 1400, output: 1300, cacheCreation: 0, cacheRead: 821000 } });
   const idx = s => stripAnsi(s).indexOf('hit');
   assert.equal(idx(a), idx(b), 'the hit column starts at the same offset regardless of dur width');
 });
