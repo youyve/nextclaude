@@ -1,10 +1,14 @@
-# NextClaude
+<p align="center">
+  <img src="https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/nextclaude_logo.png" alt="NextClaude" width="150">
+</p>
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+<h1 align="center">NextClaude</h1>
 
-Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
+<p align="center">Multi-account proxy for <a href="https://claude.ai/claude-code">Claude Code</a> — automatically rotates accounts when one runs out of quota, while minimizing the prompt-cache rebuilds that switching costs.</p>
 
-![NextClaude TUI](screenshots/nextclaude.png)
+Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max/Pro (or API key) accounts and automatically switching when one approaches its session (5h) or weekly quota limit.
+
+![NextClaude dashboard](https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/dashboard.png)
 
 ## Features
 
