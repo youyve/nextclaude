@@ -178,6 +178,9 @@ export class TUI {
     this.render();
     this.timer = setInterval(() => {
       this.frame = (this.frame + 1) % SPINNER.length;
+      // Clear expired quota windows so idle bars reset on their own. Done here
+      // (not inside render) so its log output never recurses through render.
+      this.am.refreshExpiredQuotas?.();
       this.render();
     }, 500);
   }
@@ -262,8 +265,8 @@ export class TUI {
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
+        // setActiveAccount logs the outcome (switch, or toggle back to automatic).
         this.am.setActiveAccount(this.selIdx);
-        this._addLog(`Switched all traffic to "${this.am.accounts[this.selIdx].name}"`);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -392,21 +395,27 @@ export class TUI {
   // ── rendering ──────────────────────────────────────
 
   render() {
-    if (!this.running) return;
-    // Clear expired quota windows even while idle so bars reset on their own.
-    this.am.refreshExpiredQuotas?.();
-    const W = process.stdout.columns || 80;
-    const H = process.stdout.rows || 24;
+    // Re-entrancy guard: console output is redirected to _addLog() which calls
+    // render(); if anything logged during a render (e.g. a quota-reset message),
+    // this would recurse without bound and overflow the stack. Skip nested calls.
+    if (!this.running || this._rendering) return;
+    this._rendering = true;
+    try {
+      const W = process.stdout.columns || 80;
+      const H = process.stdout.rows || 24;
 
-    if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
-      return;
+      if (W < 40 || H < 8) {
+        process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+        return;
+      }
+
+      let buf = `${ESC}H` + this._buildFrame(W, H);
+      // Show cursor only in input mode
+      buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
+      process.stdout.write(buf);
+    } finally {
+      this._rendering = false;
     }
-
-    let buf = `${ESC}H` + this._buildFrame(W, H);
-    // Show cursor only in input mode
-    buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
   }
 
   /**
@@ -513,8 +522,10 @@ export class TUI {
       dim(`↑${fmtNum(u.totalInputTokens || 0)} ↓${fmtNum(u.totalOutputTokens || 0)}`),
     ].join(dim(' · '));
 
+    const isManual = this.am.manualPin && this.am.manualPin === this.am._identity(a);
+    const pin = isManual ? `  ${cyan('★ manual')}` : '';
     const card = [
-      `${marker} ${name}   ${tier} ${dim('·')} ${status}`,
+      `${marker} ${name}   ${tier} ${dim('·')} ${status}${pin}`,
       `  ${quotaRow(l1, r1, t1)}`,
       `  ${quotaRow(l2, r2, t2)}`,
       `  ${stats}`,

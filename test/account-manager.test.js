@@ -257,6 +257,63 @@ test('chooseInitialPrimary starts on the most-remaining-quota account (the resta
   assert.equal(am.getActiveAccount('news', 1000).name, 'youyve');
 });
 
+// ── sticky 'rejected' + manual-switch authority ───────────────
+
+test("a 'rejected' status clears when the 5h window resets, not only the weekly one", () => {
+  const am = makeManager(['a']);
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.99;
+  a.quota.unified5hReset = Date.now() - 1000;       // 5h window already reset
+  a.quota.unified7d = 0.30;
+  a.quota.unified7dReset = Date.now() + 86400e3;     // weekly far off
+  a.quota.unifiedStatus = 'rejected';                // sticky before the fix
+  assert.equal(am._isAvailable(a), true, 'account is available again after 5h reset');
+  assert.equal(a.quota.unifiedStatus, null, 'stale rejected status cleared');
+  assert.equal(a.quota.unified5h, null);
+});
+
+test('manual switch is authoritative and never auto-reverts while serviceable', () => {
+  const am = makeManager(['a', 'b']);
+  setUtil(am, 'a', 0.1); // a would be the automatic pick (fresher, index 0)
+  setUtil(am, 'b', 0.5);
+  am.getActiveAccount('s1');     // auto-pins s1 to a
+  am.setActiveAccount(1);        // user manually moves to b
+  assert.equal(am.getActiveAccount('s1').name, 'b');
+  assert.equal(am.getActiveAccount('s2').name, 'b', 'new sessions follow the manual choice');
+  for (let i = 0; i < 5; i++) {
+    assert.equal(am.getActiveAccount('s1').name, 'b', 'no drift back to the cheaper account');
+  }
+});
+
+test('manual pin spills when exhausted; new sessions prefer it on recovery, warm ones are not yanked', () => {
+  const am = makeManager(['a', 'b']);
+  am.setActiveAccount(0);                 // manual -> a
+  assert.equal(am.getActiveAccount('s1').name, 'a');
+  am.accounts[0].quota.unified5h = 0.999; // a hard-exhausts
+  assert.equal(am.getActiveAccount('s1').name, 'b', 's1 spills forward to b');
+  am.accounts[0].quota.unified5h = 0.2;   // a recovers
+  assert.equal(am.getActiveAccount('s1').name, 'b', 'warm s1 is NOT yanked back (no needless rebuild)');
+  assert.equal(am.getActiveAccount('s2').name, 'a', 'new sessions prefer the manual choice again');
+});
+
+test('re-selecting the pinned account toggles back to automatic routing', () => {
+  const am = makeManager(['a', 'b']);
+  am.setActiveAccount(1);
+  assert.equal(am.manualPin, am._identity(am.accounts[1]));
+  am.setActiveAccount(1);                 // toggle off
+  assert.equal(am.manualPin, null);
+});
+
+test('manual switch clears a stale rejected/throttled status so the choice takes effect', () => {
+  const am = makeManager(['a', 'b']);
+  const b = am.accounts[1];
+  b.quota.unifiedStatus = 'rejected';
+  b.status = 'throttled';
+  b.rateLimitedUntil = Date.now() + 3600e3;
+  am.setActiveAccount(1);
+  assert.equal(am.getActiveAccount('s1').name, 'b'); // explicit choice is honored immediately
+});
+
 // ── rate-limit recovery (cooking-forever / stuck-bar fixes) ───
 
 test('markRateLimited is capped at the soonest quota reset', () => {

@@ -52,6 +52,9 @@ export class AccountManager {
       rateLimitedUntil: null,
     }));
     this.currentIndex = 0;
+    // The user's explicit account choice (TUI 's'). When set and serviceable it
+    // overrides all automatic routing — manual switching is highest priority.
+    this.manualPin = null;
     this.switchThreshold = switchThreshold;
 
     // Per-conversation account affinity (Layer 1): pin each session to one
@@ -95,17 +98,12 @@ export class AccountManager {
    */
   getActiveAccount(sessionKey = null, contextSize = null) {
     if (!sessionKey) {
-      const current = this.accounts[this.currentIndex];
-      if (this._isAvailable(current)) return current;
+      const current = this._preferredPrimary() || this.accounts[this.currentIndex];
+      if (this._isAvailable(current)) { this.currentIndex = current.index; return current; }
       return this._selectNext();
     }
 
-    let sess = this.sessions.get(sessionKey);
-    if (!sess) {
-      sess = { pinned: null, burned: new Set(), lastSeen: Date.now(), ctxPeak: null };
-      this.sessions.set(sessionKey, sess);
-      this._evictSessions();
-    }
+    const sess = this._getOrCreateSession(sessionKey);
     sess.lastSeen = Date.now();
 
     const pinned = sess.pinned ? this._byIdentity(sess.pinned) : null;
@@ -134,12 +132,12 @@ export class AccountManager {
     }
 
     if (!sess.pinned) {
-      // New conversation: prefer the account already warm with Claude Code's
-      // shared system+tools prefix (the current primary) instead of the
-      // freshest-but-cold one — every conversation shares that big prefix, so
-      // routing a new one to a different account would pay a full cold rebuild
-      // there. Spill to the best available account only if the primary can't serve.
-      const primary = this.accounts[this.currentIndex];
+      // New conversation: prefer the manual choice (if set) or the account
+      // already warm with Claude Code's shared system+tools prefix (the current
+      // primary) instead of the freshest-but-cold one — every conversation shares
+      // that big prefix, so routing a new one elsewhere pays a full cold rebuild.
+      // Spill to the best available account only if the preferred one can't serve.
+      const primary = this._preferredPrimary() || this.accounts[this.currentIndex];
       const pick = (primary && this._isAvailable(primary) && !sess.burned.has(this._identity(primary)))
         ? primary
         : (this._selectBest(sess.burned) || this._selectSoonestReset());
@@ -156,6 +154,11 @@ export class AccountManager {
     return this._switchSession(sess, sessionKey, contextSize);
   }
 
+  /** The account the user manually pinned (TUI 's'), if any and still present. */
+  _preferredPrimary() {
+    return this.manualPin ? this._byIdentity(this.manualPin) : null;
+  }
+
   /**
    * Manually route ALL traffic to a chosen account (TUI 's'). Re-pins every live
    * session to it (un-burning it) so in-flight conversations move on their next
@@ -165,8 +168,25 @@ export class AccountManager {
   setActiveAccount(index) {
     const acct = this.accounts[index];
     if (!acct) return;
-    this.currentIndex = index;
     const id = this._identity(acct);
+
+    // Toggle: choosing the already-pinned account returns to automatic routing.
+    if (this.manualPin === id) {
+      this.manualPin = null;
+      console.log(`[NextClaude] Manual pin cleared — automatic routing resumed`);
+      return;
+    }
+
+    this.manualPin = id; // preferred primary until the user switches again or clears it
+    this.currentIndex = index;
+    // Clean slate so a stale throttle / 'rejected' status doesn't keep the
+    // explicitly-chosen account unavailable. Genuine over-quota is still caught
+    // by the live utilization check, so this only clears STALE blocks.
+    acct.status = 'active';
+    acct.rateLimitedUntil = null;
+    if (acct.quota.unifiedStatus === 'rejected') acct.quota.unifiedStatus = null;
+    // Move in-flight conversations onto the chosen account now (the user opted
+    // into any one-time rebuild); new ones follow via _preferredPrimary().
     for (const s of this.sessions.values()) {
       s.pinned = id;
       s.burned.delete(id);
@@ -183,7 +203,11 @@ export class AccountManager {
    */
   _switchSession(sess, sessionKey, contextSize = null) {
     if (sess.pinned) sess.burned.add(sess.pinned);
-    let next = this._selectBest(sess.burned);
+    // Prefer the user's manual choice when it can serve and isn't burned here.
+    let next = null;
+    const m = this._preferredPrimary();
+    if (m && !sess.burned.has(this._identity(m)) && this._isAvailable(m)) next = m;
+    if (!next) next = this._selectBest(sess.burned);
     if (!next) {
       sess.burned.clear();
       next = this._selectBest() || this._selectSoonestReset();
@@ -335,6 +359,16 @@ export class AccountManager {
     return null;
   }
 
+  _getOrCreateSession(sessionKey) {
+    let sess = this.sessions.get(sessionKey);
+    if (!sess) {
+      sess = { pinned: null, burned: new Set(), lastSeen: Date.now(), ctxPeak: null };
+      this.sessions.set(sessionKey, sess);
+      this._evictSessions();
+    }
+    return sess;
+  }
+
   /** Drop idle / overflow sessions so the affinity map can't grow unbounded. */
   _evictSessions() {
     const now = Date.now();
@@ -380,6 +414,11 @@ export class AccountManager {
       console.log(`[NextClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      // The 'rejected' status is almost always driven by the 5h window; clearing
+      // it here (not only on the 7d reset) means an account that recovered its
+      // session quota stops being treated as must-switch / unavailable. A still-
+      // exhausted weekly window is still caught by the utilization check below.
+      if (q.unifiedStatus === 'rejected') q.unifiedStatus = null;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[NextClaude] Account "${account.name}" weekly quota reset`);
@@ -623,6 +662,9 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    if (this.manualPin && this._identity(this.accounts[index]) === this.manualPin) {
+      this.manualPin = null; // the manually-pinned account is gone
+    }
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {

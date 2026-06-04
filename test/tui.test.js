@@ -58,6 +58,44 @@ test('_buildFrame is exactly W x H and never overflows width', () => {
   }
 });
 
+test('render is re-entrancy guarded against logging during a render', () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'x' }], 0.98);
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, version: '1', saveConfig() {}, syncAccounts() {}, onQuit() {} });
+  tui.running = true;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  const origBuild = tui._buildFrame.bind(tui);
+  let builds = 0;
+  // Force a log mid-build, which _addLog would normally bounce back into render.
+  tui._buildFrame = (W, H) => { builds++; if (builds < 5) tui._addLog('[NextClaude] mid-render'); return origBuild(W, H); };
+  try {
+    tui.render(); // must not overflow the stack
+    assert.equal(builds, 1, 'nested render was blocked by the guard');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+});
+
+test('refreshExpiredQuotas logging does not crash a console-redirected TUI', () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'x' }], 0.98);
+  am.accounts[0].quota.unified5h = 0.9;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1000; // expired -> logs on clear
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, version: '1', saveConfig() {}, syncAccounts() {}, onQuit() {} });
+  tui.running = true;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  const origLog = console.log;
+  process.stdout.write = () => true;
+  console.log = (...a) => tui._addLog(a.join(' ')); // mimic start()'s redirect
+  try {
+    am.refreshExpiredQuotas(); // "session quota reset" -> _addLog -> render
+    tui.render();
+    assert.equal(am.accounts[0].quota.unified5h, null, 'expired quota cleared, no crash');
+  } finally {
+    console.log = origLog;
+    process.stdout.write = origWrite;
+  }
+});
+
 test('_buildFrame handles the no-accounts case', () => {
   const am = new AccountManager([], 0.98);
   const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, version: '1.1.0', saveConfig() {}, syncAccounts() {}, onQuit() {} });
