@@ -17,6 +17,8 @@
   <img src="https://img.shields.io/badge/dependencies-0-brightgreen" alt="zero dependencies">
 </p>
 
+![NextClaude dashboard](https://raw.githubusercontent.com/youyve/nextclaude/master/screenshots/dashboard.png)
+
 ## Why
 
 A single Claude Max/Pro account hits its 5-hour or weekly limit mid-task. NextClaude pools several accounts behind one local endpoint and hands off seamlessly. But naïve switching is expensive: Anthropic's prompt cache is **per-account**, so every switch re-bills your whole context as fresh tokens. NextClaude is built to make those switches **rare and cheap** — see [How it saves tokens](#how-it-saves-tokens).
