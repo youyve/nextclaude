@@ -44,9 +44,20 @@ Switching is unavoidable once an account is exhausted, but the cache cost is not
 - **Stay on one account until it's truly empty.** All your conversations share one big `system`+`tools` prefix; new ones pin to the account that's already warm — not the freshest. Everyone migrates forward together only when an account is actually exhausted, and never drifts back to a cache-cold one.
 - **Switch at the cheap moment.** Crossing the threshold only *arms* a switch; the proxy waits and lands it right after Claude Code auto-compacts, so the rebuild copies a small prefix instead of the full context. A hard ceiling forces it if needed — so it's never worse than switching early.
 - **Keep the most quota.** When a switch is forced, it picks the account with the most **5h** remaining, breaking ties by most **weekly** remaining.
-- **You stay in control.** Press `s` to pin all traffic to one account instantly (e.g. when one is overloaded); press it again to return to automatic.
+- **You stay in control.** Press `s` to pin all traffic to one account instantly (e.g. to spend one down first, or when another is overloaded). See [Manual pin](#manual-pin) for exactly how the pin behaves.
 
 It never rewrites your requests, pre-warms standby accounts, or injects long cache TTLs — tricks that corrupt the conversation or just move the cost around.
+
+### Manual pin
+
+Pressing `s` marks an account with `★ manual`. The pin is a **sticky preferred primary**, not a one-shot switch. While it's set:
+
+- New conversations route to it, and it takes priority over the quota-based selection above (this is intentional — a manual choice outranks the automatic ranking).
+- If it gets exhausted, traffic spills **forward** to another account — and then **returns to it once its 5h/weekly window resets and it's serviceable again**.
+
+That return is the one sharp edge to know about: the pinned account's prompt cache died at the 5-minute TTL long before its quota reset, so coming back to it costs **one cold rebuild** (a full `✎` row at `0%` hit). That's the price of insisting on a specific primary rather than letting NextClaude stay on whichever account is already warm. It can also pull traffic onto your *lower-quota* account — e.g. if the pinned one is nearly out of **weekly** quota while the current one is healthy, the pin still drags traffic back.
+
+**To stop this:** press `s` on the pinned account again to **toggle the pin off** and hand routing back to the automatic quota-based logic (most 5h remaining, then most weekly). Pin only when you specifically want one account to be the primary; otherwise leave it on automatic.
 
 ## Reading the dashboard
 
