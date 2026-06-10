@@ -267,20 +267,17 @@ async function sendUpstreamResponse(upstreamRes, res, accountManager, accountInd
 }
 
 /**
- * Speculatively probe the soonest-resetting account with the REAL buffered
- * request when everything looks exhausted. Returns true iff it served the
- * client (early recovery found); false means the caller should fall through to
- * the 429. Throttle + in-flight are claimed synchronously by beginProbe BEFORE
- * the fetch await, so a concurrent request can never launch a second probe.
+ * Probe ONE exhausted-looking account with the REAL buffered request. Returns
+ * { ok:true, upstreamRes } if it answered non-429 (recovered — serve it), or
+ * { ok:false } on a 429 / abort / network error (record it and move on). Does
+ * NOT manage the probe slot — the caller (tryProbeRecovery) owns begin/endProbe
+ * around the whole sweep.
  */
-async function tryProbeRecovery(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir) {
-  const candidate = accountManager.getProbeCandidate();
-  if (!candidate || !accountManager.beginProbe(candidate.index)) return false;
-
+async function probeOneAccount(req, body, accountManager, upstream, candidate) {
   let upstreamRes = null;
   try {
     await accountManager.ensureTokenFresh(candidate.index);
-    if (candidate.status === 'error') return false;
+    if (candidate.status === 'error') return { ok: false };
 
     const headers = buildUpstreamHeaders(req.headers, candidate);
     const ac = new AbortController();
@@ -305,40 +302,63 @@ async function tryProbeRecovery(req, res, body, accountManager, upstream, hooks,
     accountManager.updateQuota(candidate.index, rl);
 
     if (upstreamRes.status === 429) {
-      // Still genuinely over quota — record it and let the caller 429 the client.
+      // Still genuinely over quota — record it and let the sweep try the next.
       await upstreamRes.body?.cancel();
       const ra = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       accountManager.markRateLimited(candidate.index, ra);
-      return false;
+      return { ok: false };
     }
+    return { ok: true, upstreamRes };
   } catch (err) {
-    // Abort (timeout) or network error — fall through to the 429.
+    // Abort (timeout) or network error — move on to the next candidate.
     console.error(`[NextClaude] Probe failed on "${candidate.name}": ${err.message}`);
     if (upstreamRes) { try { await upstreamRes.body?.cancel(); } catch {} }
-    return false;
+    return { ok: false };
+  }
+}
+
+/**
+ * Speculatively probe the exhausted-looking accounts with the REAL buffered
+ * request when everything looks spent. SWEEPS every eligible account (soonest-
+ * reset first) and serves the FIRST that has rolled over — so recovery on ANY
+ * account is found, not just the soonest-resetting one. Returns true iff it
+ * served the client; false means the caller should fall through to the 429.
+ * The throttle + in-flight slot is claimed synchronously by beginProbe BEFORE
+ * the first fetch await, so a concurrent request can never launch a second sweep.
+ */
+async function tryProbeRecovery(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir) {
+  const candidates = accountManager.getProbeCandidates();
+  if (candidates.length === 0 || !accountManager.beginProbe()) return false;
+
+  try {
+    for (const candidate of candidates) {
+      if (res.destroyed) return true; // client gave up
+
+      const probe = await probeOneAccount(req, body, accountManager, upstream, candidate);
+      if (!probe.ok) continue; // still exhausted / failed — try the next account
+
+      // Early recovery confirmed. Reactivate the account so later requests route
+      // normally (a 2xx carries no unified-status header, so the stale 'rejected'
+      // would otherwise force every request back through the throttled probe).
+      accountManager.markRecovered(candidate.index);
+      ctx.account = candidate.name;
+      hooks.onRequestRouted?.(reqId, { account: candidate.name });
+      console.log(`[NextClaude] Probe found early recovery on "${candidate.name}" — serving this request`);
+
+      const logSections = logDir ? [`=== PROBE SERVED (account: ${candidate.name}) ===`] : null;
+      try {
+        await sendUpstreamResponse(probe.upstreamRes, res, accountManager, candidate.index, ctx, logDir, reqId, logSections);
+      } catch (err) {
+        console.error(`[NextClaude] Probe relay error on "${candidate.name}": ${err.message}`);
+        if (res.headersSent) { res.destroy(); return true; }
+        return false; // headers not sent yet — let the caller emit the 429
+      }
+      return true;
+    }
+    return false; // no account had recovered
   } finally {
     accountManager.endProbe();
   }
-
-  if (res.destroyed) return true; // client gave up; nothing to send, but don't 429
-
-  // Early recovery confirmed. Reactivate the account so later requests route
-  // normally (a 2xx carries no unified-status header, so the stale 'rejected'
-  // would otherwise force every request back through the throttled probe).
-  accountManager.markRecovered(candidate.index);
-  ctx.account = candidate.name;
-  hooks.onRequestRouted?.(reqId, { account: candidate.name });
-  console.log(`[NextClaude] Probe found early recovery on "${candidate.name}" — serving this request`);
-
-  const logSections = logDir ? [`=== PROBE SERVED (account: ${candidate.name}) ===`] : null;
-  try {
-    await sendUpstreamResponse(upstreamRes, res, accountManager, candidate.index, ctx, logDir, reqId, logSections);
-  } catch (err) {
-    console.error(`[NextClaude] Probe relay error on "${candidate.name}": ${err.message}`);
-    if (res.headersSent) { res.destroy(); return true; }
-    return false; // headers not sent yet — let the caller emit the 429
-  }
-  return true;
 }
 
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sessionKey = null) {

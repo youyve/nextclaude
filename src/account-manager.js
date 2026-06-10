@@ -84,8 +84,8 @@ export class AccountManager {
     // truth is to actually try upstream. getProbeCandidate()/beginProbe() let
     // server.js send ONE real request to the soonest-resetting account, gated
     // so a client retry-storm can never hammer upstream.
-    this._probeThrottleMs = 30000; // at most one upstream probe per 30s
-    this._probeTimeoutMs = 12000;  // abort a probe that hasn't answered in 12s
+    this._probeThrottleMs = 15000; // at most one probe SWEEP per 15s
+    this._probeTimeoutMs = 12000;  // abort a single probe that hasn't answered in 12s
     this._lastProbeAt = 0;
     this._probeInFlight = false;
   }
@@ -371,49 +371,53 @@ export class AccountManager {
   }
 
   /**
-   * Pick which account to speculatively PROBE when every account looks
-   * exhausted (getActiveAccount returned null). Unlike _selectSoonestReset this
-   * returns the soonest-resetting account REGARDLESS of whether its reset has
-   * passed — the whole point is to discover EARLY rolling-window recovery before
-   * the advertised timestamp. The throttle (not a clock check) is what bounds
-   * upstream load. Returns null while a probe is already in flight or within the
-   * throttle window, or when there is nothing worth probing.
+   * The ordered list of accounts to speculatively PROBE when every account looks
+   * exhausted (getActiveAccount returned null). Ordered soonest-reset FIRST —
+   * most likely to have already rolled over, so recovery is usually found on the
+   * cheapest probe — but the caller sweeps the WHOLE list, so a later-resetting
+   * account that recovered early is still discovered. (Probing only the single
+   * soonest account missed exactly that: if the *other* account came back first,
+   * it was never tried and the user stayed blocked until the official reset.)
+   * Returns [] while a probe is in flight or inside the throttle window, or when
+   * there is nothing worth probing. Reset times are used only for ORDERING — we
+   * probe regardless of whether a reset has passed, since the point is to catch
+   * recovery BEFORE the advertised timestamp.
    */
-  getProbeCandidate() {
-    if (this._probeInFlight) return null;
-    if (this._lastProbeAt && Date.now() - this._lastProbeAt < this._probeThrottleMs) return null;
-    let best = null;
-    let bestReset = Infinity;
-    for (const a of this.accounts) {
-      if (a.status === 'error') continue;
+  getProbeCandidates() {
+    if (this._probeInFlight) return [];
+    if (this._lastProbeAt && Date.now() - this._lastProbeAt < this._probeThrottleMs) return [];
+    const eligible = this.accounts.filter(a => {
+      if (a.status === 'error') return false;
       // Dead OAuth credential we can't refresh — probing it would only 401.
-      if (a.type === 'oauth' && a.expiresAt && Date.now() >= a.expiresAt && !a.refreshToken) continue;
+      if (a.type === 'oauth' && a.expiresAt && Date.now() >= a.expiresAt && !a.refreshToken) return false;
       // A hard weekly (7d) ceiling does NOT roll like the 5h window; probing an
       // account that's out of weekly quota would always 429. Skip it and let the
       // recorded weekly reset (cleared lazily / by the 15s timer) recover it.
-      if (a.quota.unified7d != null && a.quota.unified7d >= this.hardThreshold) continue;
-      const reset = a.rateLimitedUntil
+      if (a.quota.unified7d != null && a.quota.unified7d >= this.hardThreshold) return false;
+      return true;
+    });
+    const resetOf = (a) => {
+      const r = a.rateLimitedUntil
         || a.quota.unified5hReset
         || a.quota.unified7dReset
         || (a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null);
-      const key = reset == null ? Infinity : reset;
-      if (best === null || key < bestReset) { best = a; bestReset = key; }
-    }
-    return best;
+      return r == null ? Infinity : r;
+    };
+    return eligible.sort((x, y) => resetOf(x) - resetOf(y));
   }
 
   /**
-   * Atomically CLAIM the single probe slot. Must be called synchronously (no
-   * awaits) by server.js immediately before the probe's upstream fetch: setting
-   * the in-flight flag and throttle timestamp in the same tick is what stops a
-   * concurrent request from launching a second probe (Node is single-threaded,
-   * so the loser sees the claim before it can yield). Returns false if a probe
-   * is already in flight or we're inside the throttle window.
+   * Atomically CLAIM the probe slot for one sweep (which may try several
+   * accounts). Must be called synchronously (no awaits) by server.js immediately
+   * before the sweep's first upstream fetch: setting the in-flight flag and
+   * throttle timestamp in the same tick is what stops a concurrent request from
+   * launching a second sweep (Node is single-threaded, so the loser sees the
+   * claim before it can yield). Returns false if a sweep is already in flight or
+   * we're inside the throttle window.
    */
-  beginProbe(index) {
+  beginProbe() {
     if (this._probeInFlight) return false;
     if (this._lastProbeAt && Date.now() - this._lastProbeAt < this._probeThrottleMs) return false;
-    if (!this.accounts[index]) return false;
     this._probeInFlight = true;
     this._lastProbeAt = Date.now();
     return true;

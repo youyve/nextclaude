@@ -359,46 +359,46 @@ test('computeRetryAfter reflects the soonest reset, capped below the SDK honor t
 
 // ── speculative probe (all-exhausted early-recovery discovery) ──
 
-test('getProbeCandidate returns the soonest-resetting account even before its reset', () => {
+test('getProbeCandidates returns ALL eligible accounts, soonest-reset first', () => {
   const am = makeManager(['a', 'b']);
   const A = am.accounts.find(x => x.name === 'a'), B = am.accounts.find(x => x.name === 'b');
   A.quota.unified5h = 0.999; A.quota.unified5hReset = Date.now() + 3000e3; // far future
   B.quota.unified5h = 0.999; B.quota.unified5hReset = Date.now() + 100e3;  // sooner (still future)
-  const c = am.getProbeCandidate();
-  assert.equal(c.name, 'b', 'probes the soonest-resetting account regardless of future reset');
+  const c = am.getProbeCandidates();
+  assert.deepEqual(c.map(x => x.name), ['b', 'a'], 'both accounts, soonest-reset (b) first — the sweep tries every one');
 });
 
-test('getProbeCandidate is gated by the in-flight flag and the throttle window', () => {
+test('getProbeCandidates is gated by the in-flight flag and the throttle window', () => {
   const am = makeManager(['a', 'b']);
   am.accounts.forEach(a => { a.quota.unified5h = 0.999; a.quota.unified5hReset = Date.now() + 100e3; });
-  assert.ok(am.getProbeCandidate(), 'candidate available initially');
-  assert.equal(am.beginProbe(am.getProbeCandidate().index), true);
-  assert.equal(am.getProbeCandidate(), null, 'null while a probe is in flight');
+  assert.ok(am.getProbeCandidates().length, 'candidates available initially');
+  assert.equal(am.beginProbe(), true);
+  assert.deepEqual(am.getProbeCandidates(), [], 'empty while a sweep is in flight');
   am.endProbe();
-  assert.equal(am.getProbeCandidate(), null, 'null within the 30s throttle window after a probe');
-  am._lastProbeAt = Date.now() - 31000; // simulate >30s elapsed
-  assert.ok(am.getProbeCandidate(), 'candidate available again after the throttle window');
+  assert.deepEqual(am.getProbeCandidates(), [], 'empty within the throttle window after a sweep');
+  am._lastProbeAt = Date.now() - 16000; // simulate >15s elapsed
+  assert.ok(am.getProbeCandidates().length, 'candidates available again after the throttle window');
 });
 
-test('getProbeCandidate skips a weekly hard-capped account (weekly does not roll)', () => {
+test('getProbeCandidates skips a weekly hard-capped account (weekly does not roll)', () => {
   const am = makeManager(['a', 'b']);
   const A = am.accounts.find(x => x.name === 'a'), B = am.accounts.find(x => x.name === 'b');
   // a is out of WEEKLY quota with the SOONER reset, but weekly does not roll → never probe it.
   A.quota.unified7d = 0.999; A.quota.unified7dReset = Date.now() + 5 * 86400e3; A.quota.unified5hReset = Date.now() + 10e3;
   // b is only 5h-limited → the right account to probe.
   B.quota.unified5h = 0.999; B.quota.unified5hReset = Date.now() + 100e3;
-  assert.equal(am.getProbeCandidate().name, 'b', 'weekly-capped account skipped despite its sooner reset');
+  assert.deepEqual(am.getProbeCandidates().map(x => x.name), ['b'], 'weekly-capped account excluded despite its sooner reset');
 });
 
-test('beginProbe claims the slot atomically — exactly one winner', () => {
+test('beginProbe claims the sweep slot atomically — exactly one winner', () => {
   const am = makeManager(['a', 'b']);
   am.accounts.forEach(a => { a.quota.unified5h = 0.999; a.quota.unified5hReset = Date.now() + 100e3; });
-  assert.equal(am.beginProbe(0), true, 'first claim wins');
-  assert.equal(am.beginProbe(1), false, 'second claim blocked while in flight');
+  assert.equal(am.beginProbe(), true, 'first claim wins');
+  assert.equal(am.beginProbe(), false, 'second claim blocked while a sweep is in flight');
   am.endProbe();
-  assert.equal(am.beginProbe(0), false, 'still throttled right after endProbe (failed probe stays throttled)');
-  am._lastProbeAt = Date.now() - 31000;
-  assert.equal(am.beginProbe(0), true, 'claim allowed again after the throttle window elapses');
+  assert.equal(am.beginProbe(), false, 'still throttled right after endProbe (failed sweep stays throttled)');
+  am._lastProbeAt = Date.now() - 16000;
+  assert.equal(am.beginProbe(), true, 'claim allowed again after the throttle window elapses');
 });
 
 test('markRecovered clears a stale rejected status and throttle so normal routing resumes', () => {

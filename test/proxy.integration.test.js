@@ -229,11 +229,77 @@ test('probe that comes back 429 falls through to a prompt, capped 429', async ()
     const text = await res.text();
     const elapsed = Date.now() - start;
     assert.equal(res.status, 429, 'genuine exhaustion still 429s the client');
-    assert.ok(elapsed < 5000, `returns promptly on a failed probe (${elapsed}ms)`);
-    assert.equal(upstream.hits(), 1, 'one probe attempt, no hammering');
+    assert.ok(elapsed < 5000, `returns promptly on a failed sweep (${elapsed}ms)`);
+    assert.equal(upstream.hits(), 2, 'sweep tried both accounts once, then gave up — no hammering');
     assert.ok(Number(res.headers.get('retry-after')) <= 55, 'retry-after capped');
     assert.ok(/usage limit/.test(JSON.parse(text).error.message));
     assert.equal(am._probeInFlight, false, 'probe slot released');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+// Upstream that serves 200 ONLY for the account whose credential matches
+// `recoveredKey`; every other account gets a quota 429. Lets a test put recovery
+// on a *specific* account regardless of probe order.
+function makeSelectiveUpstream(recoveredKey) {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    let b = ''; req.on('data', c => (b += c)); req.on('end', () => {
+      hits++;
+      if (req.headers['x-api-key'] === recoveredKey) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'anthropic-ratelimit-unified-5h-utilization': '0.30',
+          'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 3600),
+        });
+        res.write('event: message_start\ndata: ' + JSON.stringify({
+          type: 'message_start',
+          message: { usage: { input_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 1234 } },
+        }) + '\n\n');
+        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+        res.end();
+        return;
+      }
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': '3600',
+        'anthropic-ratelimit-unified-5h-utilization': '0.999',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 120),
+      });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'exhausted' } }));
+    });
+  });
+  server.hits = () => hits;
+  return server;
+}
+
+test('sweep finds recovery on a LATER-resetting account, not just the soonest (case B)', async () => {
+  // Account a resets SOONER but is still exhausted; account b resets LATER but
+  // has already rolled over. The old single-candidate probe only tried a and
+  // never discovered b, so the user stayed blocked. The sweep must serve b.
+  const upstream = makeSelectiveUpstream('kb'); // only account b (key kb) has recovered
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  const A = am.accounts[0], B = am.accounts[1];
+  A.quota.unified5h = 0.999; A.quota.unified5hReset = Date.now() + 60e3;  A.quota.unifiedStatus = 'rejected'; // sooner
+  B.quota.unified5h = 0.999; B.quota.unified5hReset = Date.now() + 600e3; B.quota.unifiedStatus = 'rejected'; // later
+  assert.equal(am.getActiveAccount(), null, 'precondition: nothing routable from cached quota');
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, 'sweep probed a (429) then b (200) and served b — the bug the user hit');
+    assert.ok(text.includes('message_start'), 'b\'s response streamed to the client');
+    assert.equal(B.usage.totalCacheReadTokens, 1234, 'the recovered later-reset account b actually served it');
+    assert.equal(upstream.hits(), 2, 'both accounts were swept (a rejected, b served)');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -279,12 +345,12 @@ test('a second request within the throttle window does not re-probe', async () =
   }).then(async r => { await r.text(); return r.status; });
   try {
     assert.equal(await post(), 429);
-    assert.equal(upstream.hits(), 1, 'first request probes once');
+    assert.equal(upstream.hits(), 2, 'first request sweeps both accounts once');
     assert.equal(await post(), 429);
-    assert.equal(upstream.hits(), 1, 'second request inside the 30s window sends no new probe');
-    am._lastProbeAt = Date.now() - 31000; // window elapses
+    assert.equal(upstream.hits(), 2, 'second request inside the throttle window sends no new probe');
+    am._lastProbeAt = Date.now() - 16000; // 15s window elapses
     assert.equal(await post(), 429);
-    assert.equal(upstream.hits(), 2, 'after the window a fresh probe fires');
+    assert.equal(upstream.hits(), 4, 'after the window a fresh sweep fires (both accounts again)');
   } finally {
     await close(proxy);
     await close(upstream);

@@ -61,7 +61,7 @@ That return is the one sharp edge to know about: the pinned account's prompt cac
 
 ### When every account is exhausted
 
-The 5-hour limit is a **rolling** window — capacity comes back gradually, often *before* the reset time Anthropic advertises. So when all accounts look spent, NextClaude doesn't just give up: on the next request it sends **one speculative probe** (your real request) to the soonest-resetting account. If that account has quietly recovered, the response is served straight back to you — no manual resend, no waiting out the full countdown. The probe is throttled to at most once every 30s, so a retrying client can never hammer upstream.
+The 5-hour limit is a **rolling** window — capacity comes back gradually, often *before* the reset time Anthropic advertises. So when all accounts look spent, NextClaude doesn't just give up: on the next request it **sweeps every account with one speculative probe** (your real request), trying the soonest-to-reset first and serving the first one that has quietly recovered — straight back to you, no manual resend, no waiting out the full countdown. It probes *all* accounts (not just the soonest), so recovery on any one of them is caught. The whole sweep is throttled to at most once every 15s, so a retrying client can never hammer upstream.
 
 If every account really is still over quota, you get a prompt `429` instead of a connection held open for hours. The `retry-after` is capped at 55s on purpose: Claude Code's client ignores any `retry-after` ≥ 60s, so a multi-hour value would be both useless and misleading — a small value lets its built-in retries quietly pick recovery back up. Either way, **just resend if your turn ends first** and the probe will catch the recovery.
 
