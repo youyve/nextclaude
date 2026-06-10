@@ -98,6 +98,226 @@ test('end-to-end: proxy forwards, captures cache usage, and pins a session', asy
   }
 });
 
+// Stateful upstream for probe tests: 429s the first `failFirst` requests, then
+// 200s (simulates a rolling-window account recovering). Optional `delayMs` keeps
+// a probe in-flight long enough to test concurrency/timeout. Counts every hit.
+function makeRecoveringUpstream({ failFirst = 0, delayMs = 0, util = 0.20 } = {}) {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    let b = ''; req.on('data', c => (b += c)); req.on('end', () => {
+      hits++;
+      const serve200 = hits > failFirst;
+      const respond = () => {
+        if (!serve200) {
+          res.writeHead(429, {
+            'content-type': 'application/json',
+            'retry-after': '3600',
+            'anthropic-ratelimit-unified-5h-utilization': '0.999',
+            'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 120),
+          });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'exhausted' } }));
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'anthropic-ratelimit-unified-5h-utilization': String(util),
+          'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 3600),
+        });
+        res.write('event: message_start\ndata: ' + JSON.stringify({
+          type: 'message_start',
+          message: { usage: { input_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 1234 } },
+        }) + '\n\n');
+        res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', usage: { output_tokens: 7 } }) + '\n\n');
+        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+        res.end();
+      };
+      if (delayMs) setTimeout(respond, delayMs); else respond();
+    });
+  });
+  server.hits = () => hits;
+  return server;
+}
+
+// Drive both accounts into a "looks exhausted, reset in the future" state so
+// getActiveAccount returns null — the precondition for the probe path.
+function exhaustBoth(am) {
+  for (const a of am.accounts) {
+    a.quota.unified5h = 0.999;
+    a.quota.unified5hReset = Date.now() + 3600e3;
+    a.quota.unifiedStatus = 'rejected';
+  }
+}
+
+test('probe serves the turn when an exhausted account has recovered early (rolling window)', async () => {
+  const upstream = makeRecoveringUpstream(); // always 200 — the account has recovered
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  exhaustBoth(am);
+  assert.equal(am.getActiveAccount(), null, 'precondition: nothing routable from cached quota');
+
+  const ends = [];
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } },
+    { onRequestEnd: (id, info) => ends.push(info) });
+  const pPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, 'probe discovered recovery and served the turn — no manual resend');
+    assert.ok(text.includes('message_start'), 'SSE body streamed through the probe path');
+    assert.equal(upstream.hits(), 1, 'exactly one upstream probe');
+
+    const served = am.accounts.find(a => a.usage.totalRequests > 0);
+    assert.ok(served, 'usage attributed to the probed account');
+    assert.equal(served.usage.totalCacheReadTokens, 1234, 'cache usage captured on the probe path');
+    assert.equal(ends[0].usage.output, 7, 'per-request usage captured for the probe');
+    assert.notEqual(served.quota.unifiedStatus, 'rejected', 'recovered account reactivated');
+    assert.ok(am.getActiveAccount(), 'normal routing resumes after recovery (no more probing needed)');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('a recovered account still reporting high utilization stays routable (no re-probe 429)', async () => {
+  // A rolling 5h window can serve a 200 while STILL reporting near-ceiling
+  // utilization. markRecovered must relax the cached util, or the next request
+  // re-trips _mustSwitch, hits the probe throttle, and 429s a working account.
+  const upstream = makeRecoveringUpstream({ util: 0.999 });
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  exhaustBoth(am);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  const post = () => fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+  }).then(async r => { await r.text(); return r.status; });
+  try {
+    assert.equal(await post(), 200, 'probe discovers and serves the recovered account');
+    // Second request is WITHIN the 30s probe-throttle window: without the
+    // markRecovered util-relax it would route to null, hit the throttle, and
+    // 429 — even though the account just answered 200. It must be served.
+    assert.equal(await post(), 200, 'high-util-but-recovered account routes normally — no spurious 429');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('probe that comes back 429 falls through to a prompt, capped 429', async () => {
+  const upstream = makeRecoveringUpstream({ failFirst: Infinity }); // never recovers
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  exhaustBoth(am);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  try {
+    const start = Date.now();
+    const res = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+    });
+    const text = await res.text();
+    const elapsed = Date.now() - start;
+    assert.equal(res.status, 429, 'genuine exhaustion still 429s the client');
+    assert.ok(elapsed < 5000, `returns promptly on a failed probe (${elapsed}ms)`);
+    assert.equal(upstream.hits(), 1, 'one probe attempt, no hammering');
+    assert.ok(Number(res.headers.get('retry-after')) <= 55, 'retry-after capped');
+    assert.ok(/usage limit/.test(JSON.parse(text).error.message));
+    assert.equal(am._probeInFlight, false, 'probe slot released');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('two concurrent requests under full exhaustion launch exactly one probe', async () => {
+  const upstream = makeRecoveringUpstream({ delayMs: 150 }); // 200, but slow enough to stay in-flight
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  exhaustBoth(am);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  const post = () => fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+  }).then(r => r.status);
+  try {
+    const [s1, s2] = await Promise.all([post(), post()]);
+    assert.equal(upstream.hits(), 1, 'in-flight guard + throttle ⇒ exactly one upstream probe');
+    const statuses = [s1, s2].sort();
+    assert.deepEqual(statuses, [200, 429], 'one request served by the probe, the other 429s');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('a second request within the throttle window does not re-probe', async () => {
+  const upstream = makeRecoveringUpstream({ failFirst: Infinity });
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  exhaustBoth(am);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  const post = () => fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+  }).then(async r => { await r.text(); return r.status; });
+  try {
+    assert.equal(await post(), 429);
+    assert.equal(upstream.hits(), 1, 'first request probes once');
+    assert.equal(await post(), 429);
+    assert.equal(upstream.hits(), 1, 'second request inside the 30s window sends no new probe');
+    am._lastProbeAt = Date.now() - 31000; // window elapses
+    assert.equal(await post(), 429);
+    assert.equal(upstream.hits(), 2, 'after the window a fresh probe fires');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('a hung probe is aborted and the client gets a prompt 429', async () => {
+  const upstream = makeRecoveringUpstream({ delayMs: 500 }); // slower than the probe timeout
+  const uPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'ka' },
+    { name: 'b', type: 'apikey', apiKey: 'kb' },
+  ], 0.98);
+  am._probeTimeoutMs = 150; // abort well before the upstream answers
+  exhaustBoth(am);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${uPort}`, proxy: { apiKey: 'test' } });
+  const pPort = await listen(proxy);
+  try {
+    const start = Date.now();
+    const res = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
+    });
+    await res.text();
+    const elapsed = Date.now() - start;
+    assert.equal(res.status, 429, 'aborted probe falls through to the 429');
+    assert.ok(elapsed < 2000, `not pinned open by the hung upstream (${elapsed}ms)`);
+    assert.equal(am._probeInFlight, false, 'probe slot released after the abort');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 // Upstream that always rejects with a quota-exhaustion 429 and a long retry-after.
 function make429Upstream() {
   return http.createServer((req, res) => {
@@ -128,11 +348,15 @@ test('all accounts quota-exhausted returns 429 promptly (no endless hang)', asyn
       method: 'POST', headers: { 'content-type': 'application/json' }, body: chatBody(),
     });
     const elapsed = Date.now() - start;
-    await res.text();
+    const text = await res.text();
     assert.equal(res.status, 429);
     assert.ok(elapsed < 5000, `returned promptly, not held open (${elapsed}ms)`);
     const ra = Number(res.headers.get('retry-after'));
-    assert.ok(ra > 0 && ra <= 130, `retry-after reflects the ~120s reset, got ${ra}`);
+    assert.ok(ra > 0 && ra <= 55, `retry-after capped below the SDK's 60s honor threshold, got ${ra}`);
+    // The message no longer prints a misleading raw seconds countdown.
+    const msg = JSON.parse(text).error.message;
+    assert.ok(/usage limit/.test(msg) && /resend/.test(msg), `honest message, got: ${msg}`);
+    assert.ok(!/Retry in \d+s/.test(msg), 'no misleading raw seconds in the message');
   } finally {
     await close(proxy);
     await close(upstream);

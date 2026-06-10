@@ -77,6 +77,17 @@ export class AccountManager {
     this.hardThreshold = 0.995;
     this._troughDropRatio = 0.5;      // switch when context shrinks below 50% of its peak
     this._troughMinPeakBytes = 50000; // ignore tiny conversations (~12K tokens)
+
+    // Speculative-probe state. When every account looks exhausted from our
+    // CACHED quota we don't blindly 429: the unified 5h limit is a ROLLING
+    // window that can free up BEFORE its advertised reset, and the only ground
+    // truth is to actually try upstream. getProbeCandidate()/beginProbe() let
+    // server.js send ONE real request to the soonest-resetting account, gated
+    // so a client retry-storm can never hammer upstream.
+    this._probeThrottleMs = 30000; // at most one upstream probe per 30s
+    this._probeTimeoutMs = 12000;  // abort a probe that hasn't answered in 12s
+    this._lastProbeAt = 0;
+    this._probeInFlight = false;
   }
 
   /**
@@ -357,6 +368,98 @@ export class AccountManager {
       return soonestAccount;
     }
     return null;
+  }
+
+  /**
+   * Pick which account to speculatively PROBE when every account looks
+   * exhausted (getActiveAccount returned null). Unlike _selectSoonestReset this
+   * returns the soonest-resetting account REGARDLESS of whether its reset has
+   * passed — the whole point is to discover EARLY rolling-window recovery before
+   * the advertised timestamp. The throttle (not a clock check) is what bounds
+   * upstream load. Returns null while a probe is already in flight or within the
+   * throttle window, or when there is nothing worth probing.
+   */
+  getProbeCandidate() {
+    if (this._probeInFlight) return null;
+    if (this._lastProbeAt && Date.now() - this._lastProbeAt < this._probeThrottleMs) return null;
+    let best = null;
+    let bestReset = Infinity;
+    for (const a of this.accounts) {
+      if (a.status === 'error') continue;
+      // Dead OAuth credential we can't refresh — probing it would only 401.
+      if (a.type === 'oauth' && a.expiresAt && Date.now() >= a.expiresAt && !a.refreshToken) continue;
+      // A hard weekly (7d) ceiling does NOT roll like the 5h window; probing an
+      // account that's out of weekly quota would always 429. Skip it and let the
+      // recorded weekly reset (cleared lazily / by the 15s timer) recover it.
+      if (a.quota.unified7d != null && a.quota.unified7d >= this.hardThreshold) continue;
+      const reset = a.rateLimitedUntil
+        || a.quota.unified5hReset
+        || a.quota.unified7dReset
+        || (a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null);
+      const key = reset == null ? Infinity : reset;
+      if (best === null || key < bestReset) { best = a; bestReset = key; }
+    }
+    return best;
+  }
+
+  /**
+   * Atomically CLAIM the single probe slot. Must be called synchronously (no
+   * awaits) by server.js immediately before the probe's upstream fetch: setting
+   * the in-flight flag and throttle timestamp in the same tick is what stops a
+   * concurrent request from launching a second probe (Node is single-threaded,
+   * so the loser sees the claim before it can yield). Returns false if a probe
+   * is already in flight or we're inside the throttle window.
+   */
+  beginProbe(index) {
+    if (this._probeInFlight) return false;
+    if (this._lastProbeAt && Date.now() - this._lastProbeAt < this._probeThrottleMs) return false;
+    if (!this.accounts[index]) return false;
+    this._probeInFlight = true;
+    this._lastProbeAt = Date.now();
+    return true;
+  }
+
+  /**
+   * Release the probe slot once its fetch settles (success, 429, timeout, or
+   * error). Deliberately does NOT reset _lastProbeAt, so a FAILED probe stays
+   * throttled for the full window and a retry-storm cannot immediately re-probe.
+   */
+  endProbe() {
+    this._probeInFlight = false;
+  }
+
+  /**
+   * A probe came back 2xx — definitive proof the account is serviceable right
+   * now. Clear any stale block so normal routing resumes and later requests
+   * don't have to keep probing. Besides the obvious 'rejected'/throttle clear,
+   * we must also relax any cached UTILIZATION that would re-trip _mustSwitch:
+   * the 5h limit is a ROLLING window, so an account can serve a 200 while still
+   * reporting near-ceiling utilization (and a 2xx carries no unified-status
+   * header to override it). Without this, the very next request would see
+   * utilization >= hardThreshold, route to null, hit the probe throttle, and
+   * 429 the user even though the account just answered 200. We only ever LOWER
+   * the cached signal (never inflate quota); the account's next real response
+   * re-syncs the true numbers — this just guarantees it gets that next request.
+   */
+  markRecovered(index) {
+    const a = this.accounts[index];
+    if (!a) return;
+    a.status = 'active';
+    a.rateLimitedUntil = null;
+    const q = a.quota;
+    if (q.unifiedStatus === 'rejected') q.unifiedStatus = null;
+    const ceil = this.hardThreshold - 0.01; // keep it available, near the warning zone
+    if (q.unified5h != null && q.unified5h > ceil) q.unified5h = ceil;
+    if (q.unified7d != null && q.unified7d > ceil) q.unified7d = ceil;
+    if (q.tokensLimit != null && q.tokensRemaining != null) {
+      const minRemaining = Math.ceil(q.tokensLimit * (1 - ceil));
+      if (q.tokensRemaining < minRemaining) q.tokensRemaining = minRemaining;
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null) {
+      const minRemaining = Math.ceil(q.requestsLimit * (1 - ceil));
+      if (q.requestsRemaining < minRemaining) q.requestsRemaining = minRemaining;
+    }
+    this.currentIndex = index;
   }
 
   _getOrCreateSession(sessionKey) {

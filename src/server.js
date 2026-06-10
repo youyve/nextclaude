@@ -180,6 +180,167 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
+/** User-facing message when every account is over quota (no real seconds — the
+ * SDK ignores retry-after >= 60s, and the probe handles early recovery). */
+function allExhaustedMessage(n) {
+  return `All ${n} account(s) are at their usage limit. NextClaude probes for early recovery on each retry and resumes automatically as soon as any account frees up — just resend if your turn ends first.`;
+}
+
+/** Build upstream request headers from the client's, swapping in this account's
+ * credential. Shared by the normal forward path and the speculative probe so
+ * they can never drift. */
+function buildUpstreamHeaders(reqHeaders, account) {
+  const headers = {};
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    const lk = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (lk === 'x-api-key') continue;
+    // Strip accept-encoding: Node fetch auto-decompresses, which would
+    // mismatch the Content-Encoding header we forward to the client
+    if (lk === 'accept-encoding') continue;
+    headers[key] = value;
+  }
+  if (account.type === 'oauth') {
+    headers['authorization'] = `Bearer ${account.credential}`;
+  } else {
+    headers['x-api-key'] = account.credential;
+  }
+  return headers;
+}
+
+/**
+ * Relay a successful upstream response to the client: copy headers, stream (SSE)
+ * or buffer the body, capture per-request usage, and attribute it to the serving
+ * account. Shared by the normal forward path and the speculative-probe path.
+ */
+async function sendUpstreamResponse(upstreamRes, res, accountManager, accountIndex, ctx, logDir, reqId, logSections) {
+  if (logDir) {
+    logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
+  }
+
+  ctx.status = upstreamRes.status;
+
+  // Build response headers (skip hop-by-hop and encoding headers)
+  const responseHeaders = {};
+  for (const [key, value] of upstreamRes.headers.entries()) {
+    if (key === 'transfer-encoding' || key === 'connection') continue;
+    // Strip content-encoding/content-length since fetch may auto-decompress
+    if (key === 'content-encoding' || key === 'content-length') continue;
+    responseHeaders[key] = value;
+  }
+
+  res.writeHead(upstreamRes.status, responseHeaders);
+
+  if (!upstreamRes.body) {
+    if (logDir) {
+      logSections.push(`=== RESPONSE BODY ===\n(empty)`);
+      writeRequestLog(logDir, reqId, logSections);
+    }
+    res.end();
+    return;
+  }
+
+  const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
+
+  if (isStreaming) {
+    const streamLog = logDir ? [] : null;
+    await streamResponse(upstreamRes.body, res, ctx.usage, streamLog);
+    accountManager.updateUsage(accountIndex, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
+    if (logDir) {
+      logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
+      writeRequestLog(logDir, reqId, logSections);
+    }
+  } else {
+    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    extractUsageFromBody(buf, ctx.usage);
+    accountManager.updateUsage(accountIndex, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
+    if (logDir) {
+      try {
+        logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
+      } catch {
+        logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+      }
+      writeRequestLog(logDir, reqId, logSections);
+    }
+    res.end(buf);
+  }
+}
+
+/**
+ * Speculatively probe the soonest-resetting account with the REAL buffered
+ * request when everything looks exhausted. Returns true iff it served the
+ * client (early recovery found); false means the caller should fall through to
+ * the 429. Throttle + in-flight are claimed synchronously by beginProbe BEFORE
+ * the fetch await, so a concurrent request can never launch a second probe.
+ */
+async function tryProbeRecovery(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir) {
+  const candidate = accountManager.getProbeCandidate();
+  if (!candidate || !accountManager.beginProbe(candidate.index)) return false;
+
+  let upstreamRes = null;
+  try {
+    await accountManager.ensureTokenFresh(candidate.index);
+    if (candidate.status === 'error') return false;
+
+    const headers = buildUpstreamHeaders(req.headers, candidate);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), accountManager._probeTimeoutMs);
+    try {
+      upstreamRes = await fetch(`${upstream}${req.url}`, {
+        method: req.method,
+        headers,
+        body: ['GET', 'HEAD'].includes(req.method) ? undefined : body,
+        redirect: 'manual',
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Fold the probe's rate-limit headers into our quota tracking either way.
+    const rl = {};
+    for (const [k, v] of upstreamRes.headers.entries()) {
+      if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
+    }
+    accountManager.updateQuota(candidate.index, rl);
+
+    if (upstreamRes.status === 429) {
+      // Still genuinely over quota — record it and let the caller 429 the client.
+      await upstreamRes.body?.cancel();
+      const ra = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
+      accountManager.markRateLimited(candidate.index, ra);
+      return false;
+    }
+  } catch (err) {
+    // Abort (timeout) or network error — fall through to the 429.
+    console.error(`[NextClaude] Probe failed on "${candidate.name}": ${err.message}`);
+    if (upstreamRes) { try { await upstreamRes.body?.cancel(); } catch {} }
+    return false;
+  } finally {
+    accountManager.endProbe();
+  }
+
+  if (res.destroyed) return true; // client gave up; nothing to send, but don't 429
+
+  // Early recovery confirmed. Reactivate the account so later requests route
+  // normally (a 2xx carries no unified-status header, so the stale 'rejected'
+  // would otherwise force every request back through the throttled probe).
+  accountManager.markRecovered(candidate.index);
+  ctx.account = candidate.name;
+  hooks.onRequestRouted?.(reqId, { account: candidate.name });
+  console.log(`[NextClaude] Probe found early recovery on "${candidate.name}" — serving this request`);
+
+  const logSections = logDir ? [`=== PROBE SERVED (account: ${candidate.name}) ===`] : null;
+  try {
+    await sendUpstreamResponse(upstreamRes, res, accountManager, candidate.index, ctx, logDir, reqId, logSections);
+  } catch (err) {
+    console.error(`[NextClaude] Probe relay error on "${candidate.name}": ${err.message}`);
+    if (res.headersSent) { res.destroy(); return true; }
+    return false; // headers not sent yet — let the caller emit the 429
+  }
+  return true;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sessionKey = null) {
   const maxRetries = accountManager.accounts.length;
 
@@ -188,21 +349,34 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // the full history every turn, so a sharp drop marks a client auto-compaction.
   const account = accountManager.getActiveAccount(sessionKey, body.length);
   if (!account) {
+    // Every account looks exhausted from our cached quota. Before giving up,
+    // send ONE throttled speculative probe (the real request) to the soonest-
+    // resetting account: the unified 5h limit is a rolling window that can free
+    // up before its advertised reset, and only an upstream attempt can tell.
+    // Gate on retryCount===0 so we only probe on a FRESH request (where nothing
+    // was available on arrival) — never inside the retry recursion, where we
+    // just tried real accounts and already got 429s this turn.
+    if (retryCount === 0 &&
+        await tryProbeRecovery(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir)) {
+      return;
+    }
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
-    res.writeHead(429, {
-      'Content-Type': 'application/json',
-      'retry-after': String(retryAfter),
-    });
-    res.end(JSON.stringify({
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
-      },
-    }));
+    if (!res.headersSent) {
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'retry-after': String(retryAfter),
+      });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: allExhaustedMessage(accountManager.accounts.length),
+        },
+      }));
+    }
     return;
   }
 
@@ -217,23 +391,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   }
 
   // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
-    if (lk === 'accept-encoding') continue;
-    headers[key] = value;
-  }
-
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
+  const headers = buildUpstreamHeaders(req.headers, account);
 
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
@@ -305,7 +463,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
           res.end(JSON.stringify({
             type: 'error',
-            error: { type: 'rate_limit_error', message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${ra}s.` },
+            error: { type: 'rate_limit_error', message: allExhaustedMessage(accountManager.accounts.length) },
           }));
         }
         return;
@@ -331,57 +489,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
-    // Log response headers
-    if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
-    }
-
-    ctx.status = upstreamRes.status;
-
-    // Build response headers (skip hop-by-hop and encoding headers)
-    const responseHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
-      // Strip content-encoding/content-length since fetch may auto-decompress
-      if (key === 'content-encoding' || key === 'content-length') continue;
-      responseHeaders[key] = value;
-    }
-
-    res.writeHead(upstreamRes.status, responseHeaders);
-
-    if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      res.end();
-      return;
-    }
-
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
-
-    if (isStreaming) {
-      const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, ctx.usage, streamLog);
-      accountManager.updateUsage(account.index, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-    } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, ctx.usage);
-      accountManager.updateUsage(account.index, ctx.usage.input, ctx.usage.output, ctx.usage.cacheCreation, ctx.usage.cacheRead);
-      if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
-        }
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      res.end(buf);
-    }
+    await sendUpstreamResponse(upstreamRes, res, accountManager, account.index, ctx, logDir, reqId, logSections);
   } catch (err) {
     console.error(`[NextClaude] Upstream error (account "${account.name}"):`, err.message);
 
@@ -521,5 +629,12 @@ export function computeRetryAfter(accounts) {
     consider(q.unified7dReset);
     if (q.resetsAt) consider(new Date(q.resetsAt).getTime());
   }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
+  // Cap below the Anthropic SDK's retry-after honor threshold. Claude Code's
+  // client IGNORES a retry-after >= 60s (it falls back to short exponential
+  // backoff), so a raw multi-hour value is both useless to the client and
+  // misleading to the user. Keeping it < 60s means the SDK actually honors the
+  // header for its internal retries; real recovery is delivered by the probe.
+  const MAX_RETRY_AFTER_S = 55;
+  const secs = soonest === Infinity ? MAX_RETRY_AFTER_S : Math.ceil(soonest / 1000);
+  return Math.max(1, Math.min(MAX_RETRY_AFTER_S, secs));
 }

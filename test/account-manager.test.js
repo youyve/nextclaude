@@ -339,16 +339,76 @@ test('refreshExpiredQuotas clears expired windows and lifts expired throttles', 
   assert.equal(am.accounts[0].rateLimitedUntil, null);
 });
 
-test('computeRetryAfter uses unified resets, not a misleading default', () => {
-  const soon = Date.now() + 90 * 1000; // 90s
+test('computeRetryAfter reflects the soonest reset, capped below the SDK honor threshold', () => {
+  // A sub-cap reset is reported as-is (proves it uses the unified reset, not a default).
+  const soon = Date.now() + 40 * 1000; // 40s
   const accounts = [
     { rateLimitedUntil: null, quota: { unified5hReset: soon, unified7dReset: Date.now() + 86400e3 } },
     { rateLimitedUntil: null, quota: { unified5hReset: Date.now() + 3600e3 } },
   ];
   const ra = computeRetryAfter(accounts);
-  assert.ok(ra >= 80 && ra <= 95, `retry-after ~90s, got ${ra}`);
-  // no reset info → falls back to 60
-  assert.equal(computeRetryAfter([{ quota: {} }]), 60);
+  assert.ok(ra >= 35 && ra <= 45, `retry-after ~40s, got ${ra}`);
+  // A multi-hour reset is capped to <=55: Claude Code's SDK IGNORES a
+  // retry-after >= 60s, so a raw 9340s is useless to the client and misleading.
+  assert.ok(computeRetryAfter([{ quota: { unified5hReset: Date.now() + 9340e3 } }]) <= 55,
+    'far-future reset is capped to <=55');
+  // no reset info → capped default, still positive.
+  const d = computeRetryAfter([{ quota: {} }]);
+  assert.ok(d > 0 && d <= 55, `default capped, got ${d}`);
+});
+
+// ── speculative probe (all-exhausted early-recovery discovery) ──
+
+test('getProbeCandidate returns the soonest-resetting account even before its reset', () => {
+  const am = makeManager(['a', 'b']);
+  const A = am.accounts.find(x => x.name === 'a'), B = am.accounts.find(x => x.name === 'b');
+  A.quota.unified5h = 0.999; A.quota.unified5hReset = Date.now() + 3000e3; // far future
+  B.quota.unified5h = 0.999; B.quota.unified5hReset = Date.now() + 100e3;  // sooner (still future)
+  const c = am.getProbeCandidate();
+  assert.equal(c.name, 'b', 'probes the soonest-resetting account regardless of future reset');
+});
+
+test('getProbeCandidate is gated by the in-flight flag and the throttle window', () => {
+  const am = makeManager(['a', 'b']);
+  am.accounts.forEach(a => { a.quota.unified5h = 0.999; a.quota.unified5hReset = Date.now() + 100e3; });
+  assert.ok(am.getProbeCandidate(), 'candidate available initially');
+  assert.equal(am.beginProbe(am.getProbeCandidate().index), true);
+  assert.equal(am.getProbeCandidate(), null, 'null while a probe is in flight');
+  am.endProbe();
+  assert.equal(am.getProbeCandidate(), null, 'null within the 30s throttle window after a probe');
+  am._lastProbeAt = Date.now() - 31000; // simulate >30s elapsed
+  assert.ok(am.getProbeCandidate(), 'candidate available again after the throttle window');
+});
+
+test('getProbeCandidate skips a weekly hard-capped account (weekly does not roll)', () => {
+  const am = makeManager(['a', 'b']);
+  const A = am.accounts.find(x => x.name === 'a'), B = am.accounts.find(x => x.name === 'b');
+  // a is out of WEEKLY quota with the SOONER reset, but weekly does not roll → never probe it.
+  A.quota.unified7d = 0.999; A.quota.unified7dReset = Date.now() + 5 * 86400e3; A.quota.unified5hReset = Date.now() + 10e3;
+  // b is only 5h-limited → the right account to probe.
+  B.quota.unified5h = 0.999; B.quota.unified5hReset = Date.now() + 100e3;
+  assert.equal(am.getProbeCandidate().name, 'b', 'weekly-capped account skipped despite its sooner reset');
+});
+
+test('beginProbe claims the slot atomically — exactly one winner', () => {
+  const am = makeManager(['a', 'b']);
+  am.accounts.forEach(a => { a.quota.unified5h = 0.999; a.quota.unified5hReset = Date.now() + 100e3; });
+  assert.equal(am.beginProbe(0), true, 'first claim wins');
+  assert.equal(am.beginProbe(1), false, 'second claim blocked while in flight');
+  am.endProbe();
+  assert.equal(am.beginProbe(0), false, 'still throttled right after endProbe (failed probe stays throttled)');
+  am._lastProbeAt = Date.now() - 31000;
+  assert.equal(am.beginProbe(0), true, 'claim allowed again after the throttle window elapses');
+});
+
+test('markRecovered clears a stale rejected status and throttle so normal routing resumes', () => {
+  const am = makeManager(['a']);
+  const A = am.accounts[0];
+  A.status = 'throttled'; A.rateLimitedUntil = Date.now() + 100e3; A.quota.unifiedStatus = 'rejected';
+  am.markRecovered(0);
+  assert.equal(A.status, 'active');
+  assert.equal(A.rateLimitedUntil, null);
+  assert.equal(A.quota.unifiedStatus, null);
 });
 
 // ── deriveSessionKey ──────────────────────────────────────────
